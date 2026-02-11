@@ -15,7 +15,8 @@
 # Usage:
 #   sbatch --export=CKPT_DIR=$SCRATCH/dfm_generalization/baseline slurm/benchmark.slurm
 #
-# CKPT_DIR must contain: ckpt.pt, embeddings.pt, val.jsonl
+# CKPT_DIR must contain: ckpt.pt, val.jsonl
+# Embeddings are read from $SCRATCH/embeddings.pt
 
 set -euo pipefail
 
@@ -24,12 +25,17 @@ if [ -z "${CKPT_DIR:-}" ]; then
     exit 1
 fi
 
-for f in ckpt.pt embeddings.pt val.jsonl; do
+for f in ckpt.pt val.jsonl; do
     if [ ! -f "$CKPT_DIR/$f" ]; then
         echo "ERROR: $CKPT_DIR/$f not found"
         exit 1
     fi
 done
+
+if [ ! -f "$SCRATCH/embeddings.pt" ]; then
+    echo "ERROR: $SCRATCH/embeddings.pt not found"
+    exit 1
+fi
 
 module purge
 module load arch/h100
