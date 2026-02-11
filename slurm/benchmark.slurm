@@ -34,7 +34,7 @@ echo "=== Starting server on port $PORT ==="
 
 python -m dfm_server.server \
     --checkpoint "$CKPT_DIR/ckpt.pt" \
-    --embeddings "$SCRATCH/embeddings.pt" \
+    --embeddings "/lustre/fsn1/projects/rech/imi/uej51wk/embeddings.pt" \
     --port $PORT &
 SERVER_PID=$!
 
