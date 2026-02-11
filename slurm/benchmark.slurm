@@ -62,7 +62,8 @@ echo "=== Running benchmark ==="
 python benchmark.py \
     --data "$CKPT_DIR/val.jsonl" \
     --server-url http://localhost:$PORT \
-    --output-json "$RESULTS"
+    --output-json "$RESULTS" \
+    --max-learners 64
 
 echo "=== Benchmark done, results at $RESULTS ==="
 

@@ -292,7 +292,7 @@ def main():
     parser.add_argument("--data", required=True, help="Path to val.jsonl")
     parser.add_argument("--server-url", default="http://localhost:8000")
     parser.add_argument("--max-learners", type=int, default=0,
-                        help="Max learners to evaluate (0 = all)")
+                        help="Max learners per source to evaluate (0 = all)")
     parser.add_argument("--output-json", default=None,
                         help="Path to write JSON results (optional)")
     args = parser.parse_args()
@@ -308,9 +308,21 @@ def main():
     with open(args.data) as f:
         for line in f:
             learners_data.append(json.loads(line))
-    if args.max_learners > 0:
-        learners_data = learners_data[: args.max_learners]
     print(f"Loaded {len(learners_data)} learners from {args.data}")
+
+    # Assign dataset-level source to each learner
+    for learner in learners_data:
+        learner["dataset_source"] = _extract_source(learner["source"])
+
+    # Cap to max_learners per source
+    if args.max_learners > 0:
+        by_source = defaultdict(list)
+        for learner in learners_data:
+            by_source[learner["dataset_source"]].append(learner)
+        learners_data = []
+        for source in sorted(by_source):
+            learners_data.extend(by_source[source][: args.max_learners])
+        print(f"Capped to {args.max_learners} learners per source: {len(learners_data)} total")
 
     total_steps = sum(len(l["tasks"]) for l in learners_data)
     print(f"Total steps: {total_steps:,}")
@@ -319,12 +331,6 @@ def main():
     has_graded = any(
         o not in (0.0, 1.0) for l in learners_data for o in l["outcomes"]
     )
-    if has_graded:
-        print("Graded outcomes detected -- will include Pearson/Spearman correlation")
-
-    # Assign dataset-level source to each learner
-    for learner in learners_data:
-        learner["dataset_source"] = _extract_source(learner["source"])
 
     # JSON output accumulator
     json_out = {
