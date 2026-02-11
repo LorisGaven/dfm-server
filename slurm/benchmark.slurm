@@ -18,24 +18,7 @@
 # CKPT_DIR must contain: ckpt.pt, val.jsonl
 # Embeddings are read from $SCRATCH/embeddings.pt
 
-set -euo pipefail
-
-if [ -z "${CKPT_DIR:-}" ]; then
-    echo "ERROR: CKPT_DIR is not set. Usage: sbatch --export=CKPT_DIR=/path/to/checkpoint slurm/benchmark.slurm"
-    exit 1
-fi
-
-for f in ckpt.pt val.jsonl; do
-    if [ ! -f "$CKPT_DIR/$f" ]; then
-        echo "ERROR: $CKPT_DIR/$f not found"
-        exit 1
-    fi
-done
-
-if [ ! -f "$SCRATCH/embeddings.pt" ]; then
-    echo "ERROR: $SCRATCH/embeddings.pt not found"
-    exit 1
-fi
+set -eo pipefail
 
 module purge
 module load arch/h100
