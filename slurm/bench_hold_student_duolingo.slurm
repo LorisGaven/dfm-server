@@ -21,7 +21,7 @@ module load cuda/12.8.0
 conda activate dfm-server
 
 CKPT_DIR=$SCRATCH/dfm_generalization/hold_student_duolingo
-PORT=8000
+PORT=$((10000 + RANDOM % 50000))
 RESULTS="$CKPT_DIR/benchmark_results.json"
 
 echo "=== Checkpoint: $CKPT_DIR ==="
