@@ -246,11 +246,17 @@ def compute_per_learner_metrics(per_learner_results, include_correlation=False, 
 # ---------------------------------------------------------------------------
 
 
-def evaluate_prediction(client, learner_id, tasks, outcomes):
+def evaluate_prediction(client, learner_id, tasks, outcomes, max_steps=None):
     """Next-step prediction: register empty, then predict+update for each step.
+
+    Args:
+        max_steps: If set, truncate to this many steps to avoid KV cache overflow.
 
     Returns list of (prediction, target, position) tuples.
     """
+    if max_steps and len(tasks) > max_steps:
+        tasks = tasks[:max_steps]
+        outcomes = outcomes[:max_steps]
     client.register(learner_id)
     results = []
     for i, (task, outcome) in enumerate(zip(tasks, outcomes)):
@@ -261,11 +267,17 @@ def evaluate_prediction(client, learner_id, tasks, outcomes):
     return results
 
 
-def evaluate_forecast(client, learner_id, tasks, outcomes, split_idx):
+def evaluate_forecast(client, learner_id, tasks, outcomes, split_idx, max_steps=None):
     """Autoregressive forecast: register with history[:split], forecast the rest.
+
+    Args:
+        max_steps: If set, truncate total length to avoid KV cache overflow.
 
     Returns list of (prediction, target, horizon) tuples.
     """
+    if max_steps and len(tasks) > max_steps:
+        tasks = tasks[:max_steps]
+        outcomes = outcomes[:max_steps]
     prefix_tasks = tasks[:split_idx]
     prefix_outcomes = outcomes[:split_idx]
     future_tasks = tasks[split_idx:]
@@ -302,6 +314,9 @@ def main():
     health = client.health()
     print(f"Server OK: {health['learner_count']} learners registered")
     model_config = client.config()
+    # KV cache limit: 2 interleaved tokens per step + 2 for BOS
+    max_steps = model_config.get("block_size", 4096) // 2 - 1
+    print(f"Max steps per learner: {max_steps}")
 
     # Load data
     learners_data = []
@@ -411,7 +426,7 @@ def main():
         tasks = learner["tasks"]
         outcomes = learner["outcomes"]
         ds = learner["dataset_source"]
-        results = evaluate_prediction(client, lid, tasks, outcomes)
+        results = evaluate_prediction(client, lid, tasks, outcomes, max_steps)
         per_learner_pred.append(results)
         for pred, target, pos in results:
             per_source_pred[ds].append((pred, target, pos))
@@ -521,7 +536,7 @@ def main():
             split_idx = max(1, int(len(tasks) * frac))
             if split_idx >= len(tasks):
                 continue
-            results = evaluate_forecast(client, lid, tasks, outcomes, split_idx)
+            results = evaluate_forecast(client, lid, tasks, outcomes, split_idx, max_steps)
             for pred, target, horizon in results:
                 fc_results.append((pred, target, horizon, learner["dataset_source"]))
             print(f"\r  prefix={frac:.0%} [{i + 1}/{len(learners_data)}]", end="", flush=True)

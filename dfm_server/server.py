@@ -154,7 +154,7 @@ task_to_idx: dict[str, int] = {}
 emb_tensor: torch.Tensor | None = None  # (n_vocab+1, n_input), row 0 = BOS zeros
 learners: dict[str, KVCache] = {}
 
-MAX_SEQ_LEN = 4096  # max interleaved tokens per learner
+MAX_SEQ_LEN = 32768  # max interleaved tokens per learner
 
 
 # ---------------------------------------------------------------------------
