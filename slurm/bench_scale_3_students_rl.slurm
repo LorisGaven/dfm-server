@@ -3,7 +3,7 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/bench-scale_3_students_rl-%j.out
 #SBATCH --error=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/bench-scale_3_students_rl-%j.err
-#SBATCH --qos=qos_gpu_h100-dev
+#SBATCH --qos=qos_gpu_h100-t3
 #SBATCH -C h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
