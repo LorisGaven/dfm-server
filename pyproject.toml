@@ -2,7 +2,7 @@
 name = "dfm-server"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.0", "fastapi", "uvicorn[standard]", "pydantic-settings"]
+dependencies = ["torch>=2.0", "fastapi", "uvicorn[standard]", "pydantic-settings", "rich", "requests", "matplotlib", "numpy"]
 
 [tool.setuptools.packages.find]
 include = ["dfm_server*"]
