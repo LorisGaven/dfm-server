@@ -4,5 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.0", "fastapi", "uvicorn[standard]", "pydantic-settings"]
 
+[tool.setuptools.packages.find]
+include = ["dfm_server*"]
+
 [project.scripts]
 dfm-server = "dfm_server.server:main"

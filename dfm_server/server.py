@@ -139,9 +139,12 @@ from .schemas import (
     PredictResponse,
     RegisterRequest,
     RegisterResponse,
+    SearchRequest,
+    SearchResponse,
     UpdateRequest,
     UpdateResponse,
 )
+from .search import run_search
 
 # ---------------------------------------------------------------------------
 # Global state (populated at startup)
@@ -435,6 +438,65 @@ def forecast(req: ForecastRequest):
     return ForecastResponse(learner_id=req.learner_id, predictions=predictions)
 
 
+@app.post("/search", response_model=SearchResponse)
+@torch.no_grad()
+def search(req: SearchRequest):
+    kv_cache = get_learner(req.learner_id)
+
+    if req.depth <= 0:
+        raise HTTPException(status_code=400, detail="depth must be > 0")
+    if not req.target_tasks:
+        raise HTTPException(status_code=400, detail="target_tasks must not be empty")
+    if not req.candidate_tasks:
+        raise HTTPException(status_code=400, detail="candidate_tasks must not be empty")
+    if req.population_size < req.elite_count:
+        raise HTTPException(status_code=400, detail="population_size must be >= elite_count")
+    if kv_cache.pos + 2 * req.depth > MAX_SEQ_LEN:
+        raise HTTPException(status_code=400, detail="Search depth would exceed MAX_SEQ_LEN")
+
+    # Validate and look up target task indices
+    target_indices = []
+    for t in req.target_tasks:
+        idx = task_to_idx.get(t)
+        if idx is None:
+            raise HTTPException(status_code=400, detail=f"Unknown target task: '{t}'")
+        target_indices.append(idx)
+
+    # Validate and look up candidate task indices
+    candidate_indices = []
+    candidate_names = []
+    for t in req.candidate_tasks:
+        idx = task_to_idx.get(t)
+        if idx is None:
+            raise HTTPException(status_code=400, detail=f"Unknown candidate task: '{t}'")
+        candidate_indices.append(idx)
+        candidate_names.append(t)
+
+    best_sequence, best_fitness = run_search(
+        model=model,
+        kv_cache=kv_cache,
+        candidate_indices=candidate_indices,
+        target_indices=target_indices,
+        candidate_names=candidate_names,
+        emb_tensor=emb_tensor,
+        depth=req.depth,
+        population_size=req.population_size,
+        generations=req.generations,
+        elite_count=req.elite_count,
+        tournament_size=req.tournament_size,
+        crossover_rate=req.crossover_rate,
+        mutation_rate=req.mutation_rate,
+        eval_every=req.eval_every,
+        seed=req.seed,
+    )
+
+    return SearchResponse(
+        learner_id=req.learner_id,
+        best_sequence=best_sequence,
+        best_fitness=best_fitness,
+    )
+
+
 @app.delete("/learners/{learner_id}", response_model=DeleteResponse)
 def delete_learner(learner_id: str):
     if learner_id not in learners:
@@ -506,7 +568,7 @@ def main():
     console.print()
     console.rule("[bold green]Serving")
     console.print(f"  Listening on [bold]http://{args.host}:{args.port}[/]")
-    console.print(f"  Endpoints:   [cyan]/learners  /predict  /update  /forecast  /tasks  /health[/]")
+    console.print(f"  Endpoints:   [cyan]/learners  /predict  /update  /forecast  /search  /tasks  /health[/]")
     console.print()
 
     # Suppress uvicorn's default access/info logs — we have our own status line

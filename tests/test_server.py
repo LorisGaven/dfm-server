@@ -306,6 +306,166 @@ def test_learner_count():
     assert client.get("/health").json()["learner_count"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Search tests
+# ---------------------------------------------------------------------------
+
+SEARCH_CANDIDATES = [f"task_{i}" for i in range(N_TASKS)]
+SEARCH_TARGETS = ["task_0", "task_1"]
+
+
+def test_search_returns_valid_response():
+    client.post("/learners", json={"learner_id": "search1"})
+    r = client.post("/search", json={
+        "learner_id": "search1",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 3,
+        "population_size": 8,
+        "generations": 2,
+        "elite_count": 2,
+        "seed": 42,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["learner_id"] == "search1"
+    assert len(data["best_sequence"]) == 3
+    for task in data["best_sequence"]:
+        assert task in SEARCH_CANDIDATES
+    assert 0.0 <= data["best_fitness"] <= 1.0
+    client.delete("/learners/search1")
+
+
+def test_search_is_non_destructive():
+    """Search should not change the learner's cache."""
+    client.post("/learners", json={"learner_id": "search_nd"})
+    client.post("/update", json={"learner_id": "search_nd", "task": "task_0", "outcome": 1.0})
+
+    r1 = client.post("/predict", json={"learner_id": "search_nd", "tasks": ["task_1"]})
+    client.post("/search", json={
+        "learner_id": "search_nd",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 2,
+        "population_size": 4,
+        "generations": 2,
+        "elite_count": 1,
+        "seed": 42,
+    })
+    r2 = client.post("/predict", json={"learner_id": "search_nd", "tasks": ["task_1"]})
+    assert r1.json()["predictions"] == r2.json()["predictions"]
+    client.delete("/learners/search_nd")
+
+
+def test_search_deterministic_with_seed():
+    client.post("/learners", json={"learner_id": "search_det1"})
+    client.post("/learners", json={"learner_id": "search_det2"})
+    body = {
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 3,
+        "population_size": 8,
+        "generations": 3,
+        "elite_count": 2,
+        "seed": 123,
+    }
+    r1 = client.post("/search", json={"learner_id": "search_det1", **body})
+    r2 = client.post("/search", json={"learner_id": "search_det2", **body})
+    assert r1.json()["best_sequence"] == r2.json()["best_sequence"]
+    assert r1.json()["best_fitness"] == r2.json()["best_fitness"]
+    client.delete("/learners/search_det1")
+    client.delete("/learners/search_det2")
+
+
+def test_search_unknown_target_task():
+    client.post("/learners", json={"learner_id": "search_utt"})
+    r = client.post("/search", json={
+        "learner_id": "search_utt",
+        "target_tasks": ["nonexistent_task"],
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 2,
+    })
+    assert r.status_code == 400
+    client.delete("/learners/search_utt")
+
+
+def test_search_unknown_candidate_task():
+    client.post("/learners", json={"learner_id": "search_uct"})
+    r = client.post("/search", json={
+        "learner_id": "search_uct",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": ["nonexistent_task"],
+        "depth": 2,
+    })
+    assert r.status_code == 400
+    client.delete("/learners/search_uct")
+
+
+def test_search_nonexistent_learner():
+    r = client.post("/search", json={
+        "learner_id": "nope",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 2,
+    })
+    assert r.status_code == 404
+
+
+def test_search_fitness_improves_over_generations():
+    """More generations should produce fitness >= fewer generations (elitism preserves best)."""
+    client.post("/learners", json={"learner_id": "search_imp1"})
+    client.post("/learners", json={"learner_id": "search_imp2"})
+    base = {
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 3,
+        "population_size": 16,
+        "elite_count": 2,
+        "seed": 42,
+    }
+    r_few = client.post("/search", json={"learner_id": "search_imp1", "generations": 1, **base})
+    r_many = client.post("/search", json={"learner_id": "search_imp2", "generations": 10, **base})
+    assert r_many.json()["best_fitness"] >= r_few.json()["best_fitness"]
+    client.delete("/learners/search_imp1")
+    client.delete("/learners/search_imp2")
+
+
+def test_search_with_eval_every():
+    client.post("/learners", json={"learner_id": "search_ee"})
+    r = client.post("/search", json={
+        "learner_id": "search_ee",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": SEARCH_CANDIDATES,
+        "depth": 4,
+        "population_size": 8,
+        "generations": 2,
+        "elite_count": 2,
+        "eval_every": 2,
+        "seed": 42,
+    })
+    assert r.status_code == 200
+    assert 0.0 <= r.json()["best_fitness"] <= 1.0
+    client.delete("/learners/search_ee")
+
+
+def test_search_single_candidate():
+    """With only one candidate, the sequence must be [task] * depth."""
+    client.post("/learners", json={"learner_id": "search_sc"})
+    r = client.post("/search", json={
+        "learner_id": "search_sc",
+        "target_tasks": SEARCH_TARGETS,
+        "candidate_tasks": ["task_5"],
+        "depth": 3,
+        "population_size": 4,
+        "generations": 2,
+        "elite_count": 1,
+        "seed": 42,
+    })
+    assert r.status_code == 200
+    assert r.json()["best_sequence"] == ["task_5", "task_5", "task_5"]
+    client.delete("/learners/search_sc")
+
+
 if __name__ == "__main__":
     import sys
 

@@ -7,17 +7,32 @@ Usage:
 
     # Then run the benchmark:
     python benchmark.py --data val.jsonl [--server-url http://localhost:8000]
-                        [--max-learners 0]
+                        [--max-learners 0] [--output-json results.json]
 """
 
 import argparse
 import json
+import math
 import time
 from collections import defaultdict
+from datetime import datetime
 
 from dfm_server.client import DFMClient
 
 FORECAST_SPLITS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+_KNOWN_SOURCES = [
+    "dbe_kt22", "duolingo", "adaptivmath", "codeworkout",
+    "xes3g5m", "eedi", "ollv2", "ollv1", "icl", "rl",
+]
+
+
+def _extract_source(name):
+    """Extract dataset-level source label from trajectory name."""
+    for src in _KNOWN_SOURCES:
+        if name.startswith(src):
+            return src
+    return name.split("_")[0]
 
 
 # ---------------------------------------------------------------------------
@@ -25,13 +40,15 @@ FORECAST_SPLITS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 # ---------------------------------------------------------------------------
 
 
-def compute_metrics(predictions, targets):
-    """Compute BCE, accuracy, MAE, and AUC from lists of floats."""
-    import math
-
+def compute_metrics(predictions, targets, include_correlation=False):
+    """Compute BCE, accuracy, MAE, AUC, and optionally Pearson/Spearman."""
     n = len(predictions)
     if n == 0:
-        return {"bce": None, "accuracy": None, "mae": None, "auc": None, "n": 0}
+        out = {"bce": None, "accuracy": None, "mae": None, "auc": None, "n": 0}
+        if include_correlation:
+            out["pearson"] = None
+            out["spearman"] = None
+        return out
 
     eps = 1e-7
     bce = 0.0
@@ -47,7 +64,10 @@ def compute_metrics(predictions, targets):
 
     auc = _auc(predictions, targets)
 
-    return {"bce": bce, "accuracy": accuracy, "mae": mae, "auc": auc, "n": n}
+    out = {"bce": bce, "accuracy": accuracy, "mae": mae, "auc": auc, "n": n}
+    if include_correlation:
+        out["pearson"], out["spearman"] = _correlations(predictions, targets)
+    return out
 
 
 def _auc(predictions, targets):
@@ -77,6 +97,49 @@ def _auc(predictions, targets):
     return auc / (n_pos * n_neg)
 
 
+def _correlations(predictions, targets):
+    """Compute Pearson and Spearman correlation. Returns (pearson, spearman)."""
+    n = len(predictions)
+    if n < 3:
+        return None, None
+
+    # Pearson
+    mean_p = sum(predictions) / n
+    mean_t = sum(targets) / n
+    cov = sum((p - mean_p) * (t - mean_t) for p, t in zip(predictions, targets))
+    var_p = sum((p - mean_p) ** 2 for p in predictions)
+    var_t = sum((t - mean_t) ** 2 for t in targets)
+    denom = (var_p * var_t) ** 0.5
+    pearson = cov / denom if denom > 0 else None
+
+    # Spearman (rank correlation = Pearson on ranks)
+    def _rank(vals):
+        indexed = sorted(enumerate(vals), key=lambda x: x[1])
+        ranks = [0.0] * len(vals)
+        i = 0
+        while i < len(indexed):
+            j = i
+            while j < len(indexed) and indexed[j][1] == indexed[i][1]:
+                j += 1
+            avg_rank = (i + j - 1) / 2.0
+            for k in range(i, j):
+                ranks[indexed[k][0]] = avg_rank
+            i = j
+        return ranks
+
+    rank_p = _rank(predictions)
+    rank_t = _rank(targets)
+    mean_rp = sum(rank_p) / n
+    mean_rt = sum(rank_t) / n
+    cov_r = sum((rp - mean_rp) * (rt - mean_rt) for rp, rt in zip(rank_p, rank_t))
+    var_rp = sum((rp - mean_rp) ** 2 for rp in rank_p)
+    var_rt = sum((rt - mean_rt) ** 2 for rt in rank_t)
+    denom_r = (var_rp * var_rt) ** 0.5
+    spearman = cov_r / denom_r if denom_r > 0 else None
+
+    return pearson, spearman
+
+
 def calibration_bins(predictions, targets, n_bins=10):
     """Compute calibration: for each probability bin, expected vs observed frequency."""
     bins = defaultdict(lambda: {"pred_sum": 0.0, "target_sum": 0.0, "count": 0})
@@ -100,6 +163,82 @@ def calibration_bins(predictions, targets, n_bins=10):
 
 def fmt_metric(v, fmt=".4f"):
     return f"{v:{fmt}}" if v is not None else "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Baselines
+# ---------------------------------------------------------------------------
+
+
+def compute_baselines(learners_data):
+    """Compute baseline predictions (no server needed).
+
+    Returns: {name: list of per-learner result lists}
+    Each per-learner list contains (pred, target, pos) tuples.
+    """
+    all_outcomes = [o for l in learners_data for o in l["outcomes"]]
+    global_mean = sum(all_outcomes) / len(all_outcomes) if all_outcomes else 0.5
+
+    baselines = {"global_mean": [], "running_avg": [], "last_outcome": []}
+
+    for learner in learners_data:
+        outcomes = learner["outcomes"]
+        gm_results = []
+        ra_results = []
+        lo_results = []
+        running_sum = 0.0
+        for i, outcome in enumerate(outcomes):
+            gm_results.append((global_mean, outcome, i))
+            ra_results.append((running_sum / i if i > 0 else global_mean, outcome, i))
+            lo_results.append((outcomes[i - 1] if i > 0 else global_mean, outcome, i))
+            running_sum += outcome
+        baselines["global_mean"].append(gm_results)
+        baselines["running_avg"].append(ra_results)
+        baselines["last_outcome"].append(lo_results)
+
+    return baselines
+
+
+def compute_per_learner_metrics(per_learner_results, include_correlation=False, min_steps=5):
+    """Compute metrics per learner, return mean and std across learners.
+
+    Args:
+        per_learner_results: list of [(pred, target, pos), ...] per learner
+        include_correlation: whether to include Pearson/Spearman
+        min_steps: skip learners with fewer steps
+
+    Returns: {"mean": {...}, "std": {...}, "n_learners": int}
+    """
+    keys = ["bce", "accuracy", "mae", "auc"]
+    if include_correlation:
+        keys += ["pearson", "spearman"]
+
+    learner_metrics = []
+    for results in per_learner_results:
+        if len(results) < min_steps:
+            continue
+        m = compute_metrics(
+            [r[0] for r in results], [r[1] for r in results],
+            include_correlation=include_correlation,
+        )
+        learner_metrics.append(m)
+
+    if not learner_metrics:
+        return {"mean": {k: None for k in keys}, "std": {k: None for k in keys}, "n_learners": 0}
+
+    mean_metrics = {}
+    std_metrics = {}
+    for key in keys:
+        values = [m[key] for m in learner_metrics if m[key] is not None]
+        if values:
+            mean_metrics[key] = sum(values) / len(values)
+            var = sum((v - mean_metrics[key]) ** 2 for v in values) / len(values)
+            std_metrics[key] = var ** 0.5
+        else:
+            mean_metrics[key] = None
+            std_metrics[key] = None
+
+    return {"mean": mean_metrics, "std": std_metrics, "n_learners": len(learner_metrics)}
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +293,15 @@ def main():
     parser.add_argument("--server-url", default="http://localhost:8000")
     parser.add_argument("--max-learners", type=int, default=0,
                         help="Max learners to evaluate (0 = all)")
+    parser.add_argument("--output-json", default=None,
+                        help="Path to write JSON results (optional)")
     args = parser.parse_args()
 
     # Check server
     client = DFMClient(args.server_url)
     health = client.health()
     print(f"Server OK: {health['learner_count']} learners registered")
+    model_config = client.config()
 
     # Load data
     learners_data = []
@@ -173,50 +315,155 @@ def main():
     total_steps = sum(len(l["tasks"]) for l in learners_data)
     print(f"Total steps: {total_steps:,}")
 
+    # Detect graded outcomes
+    has_graded = any(
+        o not in (0.0, 1.0) for l in learners_data for o in l["outcomes"]
+    )
+    if has_graded:
+        print("Graded outcomes detected -- will include Pearson/Spearman correlation")
+
+    # Assign dataset-level source to each learner
+    for learner in learners_data:
+        learner["dataset_source"] = _extract_source(learner["source"])
+
+    # JSON output accumulator
+    json_out = {
+        "metadata": {
+            "data_path": args.data,
+            "server_url": args.server_url,
+            "timestamp": datetime.now().isoformat(),
+            "n_learners": len(learners_data),
+            "total_steps": total_steps,
+            "model_config": model_config,
+            "has_graded_outcomes": has_graded,
+        },
+    }
+
     # ===================================================================
-    # 1. Next-step prediction (run once)
+    # 0. Baselines (no server needed)
+    # ===================================================================
+    print("\n" + "=" * 70)
+    print("BASELINES (computed from val data, no model)")
+    print("=" * 70)
+
+    baseline_per_learner = compute_baselines(learners_data)
+    baseline_overall = {}
+    json_out["baselines"] = {}
+
+    for bl_name, per_learner_results in baseline_per_learner.items():
+        all_results = [r for results in per_learner_results for r in results]
+        preds = [r[0] for r in all_results]
+        tgts = [r[1] for r in all_results]
+        overall = compute_metrics(preds, tgts, include_correlation=has_graded)
+        baseline_overall[bl_name] = overall
+        pl_stats = compute_per_learner_metrics(per_learner_results, include_correlation=has_graded)
+
+        # Per-source
+        per_source = defaultdict(list)
+        for learner, results in zip(learners_data, per_learner_results):
+            per_source[learner["dataset_source"]].extend(results)
+        per_source_metrics = {}
+        for src, items in sorted(per_source.items()):
+            per_source_metrics[src] = compute_metrics(
+                [r[0] for r in items], [r[1] for r in items], include_correlation=has_graded,
+            )
+
+        json_out["baselines"][bl_name] = {
+            "overall": overall,
+            "per_source": per_source_metrics,
+            "per_learner": pl_stats,
+        }
+
+    print(f"\n  {'Method':<16} {'N':>6} {'BCE':>8} {'Acc':>8} {'MAE':>8} {'AUC':>8}", end="")
+    if has_graded:
+        print(f" {'Pearson':>8} {'Spearman':>8}", end="")
+    print()
+    print(f"  {'-' * 16} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8}", end="")
+    if has_graded:
+        print(f" {'-' * 8} {'-' * 8}", end="")
+    print()
+    for bl_name, m in baseline_overall.items():
+        print(f"  {bl_name:<16} {m['n']:>6} {fmt_metric(m['bce']):>8} {fmt_metric(m['accuracy']):>8} {fmt_metric(m['mae']):>8} {fmt_metric(m['auc']):>8}", end="")
+        if has_graded:
+            print(f" {fmt_metric(m.get('pearson')):>8} {fmt_metric(m.get('spearman')):>8}", end="")
+        print()
+
+    # ===================================================================
+    # 1. Next-step prediction
     # ===================================================================
     print("\n" + "=" * 70)
     print("NEXT-STEP PREDICTION")
     print("=" * 70)
 
-    all_pred_results = []  # (pred, target, position, source)
-    per_source_pred = defaultdict(list)
+    per_learner_pred = []  # list of per-learner result lists
+    per_source_pred = defaultdict(list)  # dataset_source -> [(pred, target, pos)]
     per_position_pred = defaultdict(list)
 
     t0 = time.time()
     for i, learner in enumerate(learners_data):
         lid = f"bench_pred_{i}"
-        source = learner["source"]
         tasks = learner["tasks"]
         outcomes = learner["outcomes"]
+        ds = learner["dataset_source"]
         results = evaluate_prediction(client, lid, tasks, outcomes)
+        per_learner_pred.append(results)
         for pred, target, pos in results:
-            all_pred_results.append((pred, target, pos, source))
-            per_source_pred[source].append((pred, target, pos))
+            per_source_pred[ds].append((pred, target, pos))
             per_position_pred[pos].append((pred, target))
-        print(f"\r  [{i + 1}/{len(learners_data)}] {source} ({len(tasks)} steps)", end="", flush=True)
+        print(f"\r  [{i + 1}/{len(learners_data)}] {ds} ({len(tasks)} steps)", end="", flush=True)
     pred_time = time.time() - t0
     print(f"\n  Completed in {pred_time:.1f}s ({total_steps / pred_time:.0f} steps/s)")
 
     # Overall metrics
-    preds_all = [r[0] for r in all_pred_results]
-    targets_all = [r[1] for r in all_pred_results]
-    overall_pred = compute_metrics(preds_all, targets_all)
+    all_pred_flat = [r for results in per_learner_pred for r in results]
+    preds_all = [r[0] for r in all_pred_flat]
+    targets_all = [r[1] for r in all_pred_flat]
+    overall_pred = compute_metrics(preds_all, targets_all, include_correlation=has_graded)
+
     print(f"\n  Overall ({overall_pred['n']:,} predictions):")
     print(f"    BCE:      {fmt_metric(overall_pred['bce'])}")
     print(f"    Accuracy: {fmt_metric(overall_pred['accuracy'])}")
     print(f"    MAE:      {fmt_metric(overall_pred['mae'])}")
     print(f"    AUC:      {fmt_metric(overall_pred['auc'])}")
+    if has_graded:
+        print(f"    Pearson:  {fmt_metric(overall_pred.get('pearson'))}")
+        print(f"    Spearman: {fmt_metric(overall_pred.get('spearman'))}")
+
+    # Per-learner statistics
+    pl_stats = compute_per_learner_metrics(per_learner_pred, include_correlation=has_graded)
+    print(f"\n  Per-learner (N={pl_stats['n_learners']}):", end="")
+    for key in ["bce", "accuracy", "mae", "auc"]:
+        m = pl_stats["mean"].get(key)
+        s = pl_stats["std"].get(key)
+        if m is not None and s is not None:
+            print(f"  {key.upper()} {m:.4f}+-{s:.4f}", end="")
+    print()
 
     # Per-source metrics
+    per_source_metrics = {}
     print(f"\n  Per source ({len(per_source_pred)} sources):")
-    print(f"    {'Source':<40} {'N':>6} {'BCE':>8} {'Acc':>8} {'MAE':>8} {'AUC':>8}")
-    print(f"    {'-' * 40} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8}")
+    print(f"    {'Source':<20} {'N':>6} {'BCE':>8} {'Acc':>8} {'MAE':>8} {'AUC':>8}")
+    print(f"    {'-' * 20} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8}")
     for source in sorted(per_source_pred):
         items = per_source_pred[source]
-        m = compute_metrics([p for p, _, _ in items], [t for _, t, _ in items])
-        print(f"    {source[:40]:<40} {m['n']:>6} {fmt_metric(m['bce']):>8} {fmt_metric(m['accuracy']):>8} {fmt_metric(m['mae']):>8} {fmt_metric(m['auc']):>8}")
+        m = compute_metrics([p for p, _, _ in items], [t for _, t, _ in items], include_correlation=has_graded)
+        per_source_metrics[source] = m
+        print(f"    {source:<20} {m['n']:>6} {fmt_metric(m['bce']):>8} {fmt_metric(m['accuracy']):>8} {fmt_metric(m['mae']):>8} {fmt_metric(m['auc']):>8}")
+
+    # Model vs baseline comparison
+    print(f"\n  Model vs Baselines:")
+    print(f"    {'Method':<16} {'BCE':>8} {'Acc':>8} {'MAE':>8} {'AUC':>8}")
+    print(f"    {'-' * 16} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8}")
+    print(f"    {'DFM':<16} {fmt_metric(overall_pred['bce']):>8} {fmt_metric(overall_pred['accuracy']):>8} {fmt_metric(overall_pred['mae']):>8} {fmt_metric(overall_pred['auc']):>8}")
+    for bl_name, m in baseline_overall.items():
+        print(f"    {bl_name:<16} {fmt_metric(m['bce']):>8} {fmt_metric(m['accuracy']):>8} {fmt_metric(m['mae']):>8} {fmt_metric(m['auc']):>8}")
+
+    json_out["prediction"] = {
+        "overall": overall_pred,
+        "per_source": per_source_metrics,
+        "per_learner": pl_stats,
+    }
+    json_out["metadata"]["prediction_time_s"] = pred_time
 
     # Per-position accuracy (binned)
     print(f"\n  Accuracy by history length:")
@@ -248,20 +495,15 @@ def main():
     print("AUTOREGRESSIVE FORECAST (prefix = 10%, 20%, ..., 90%)")
     print("=" * 70)
 
-    # Build index: for each learner+source, store the prediction results by position
-    # so we can efficiently extract the "predict" baseline on the forecasted portion
-    pred_by_learner = []  # list parallel to learners_data, each is {pos: (pred, target)}
-    for i, learner in enumerate(learners_data):
-        source = learner["source"]
-        lookup = {}
-        for pred, target, pos, src in all_pred_results:
-            if src == source:
-                lookup[pos] = (pred, target)
+    # Build per-learner prediction lookup for forecast comparison
+    pred_by_learner = []
+    for i, results in enumerate(per_learner_pred):
+        lookup = {pos: (pred, target) for pred, target, pos in results}
         pred_by_learner.append(lookup)
 
     # Per-split results
     forecast_summary = []  # list of (frac, overall_metrics, time)
-    all_fc_by_split = {}  # frac -> [(pred, target, horizon, source)]
+    all_fc_by_split = {}  # frac -> [(pred, target, horizon, dataset_source)]
 
     for frac in FORECAST_SPLITS:
         t0 = time.time()
@@ -275,7 +517,7 @@ def main():
                 continue
             results = evaluate_forecast(client, lid, tasks, outcomes, split_idx)
             for pred, target, horizon in results:
-                fc_results.append((pred, target, horizon, learner["source"]))
+                fc_results.append((pred, target, horizon, learner["dataset_source"]))
             print(f"\r  prefix={frac:.0%} [{i + 1}/{len(learners_data)}]", end="", flush=True)
         fc_time = time.time() - t0
 
@@ -292,6 +534,13 @@ def main():
     print(f"  {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 7}")
     for frac, m, t in forecast_summary:
         print(f"  {frac:>7.0%} {m['n']:>8} {fmt_metric(m['bce']):>8} {fmt_metric(m['accuracy']):>8} {fmt_metric(m['mae']):>8} {fmt_metric(m['auc']):>8} {t:>6.1f}s")
+
+    total_fc_time = sum(t for _, _, t in forecast_summary)
+
+    json_out["forecast"] = {
+        f"{frac}": m for frac, m, _ in forecast_summary
+    }
+    json_out["metadata"]["forecast_time_s"] = total_fc_time
 
     # ===================================================================
     # 3. Forecast accuracy by horizon (per split)
@@ -337,17 +586,32 @@ def main():
         if not fc_results:
             continue
 
-        # Collect the prediction-mode results for the same positions
-        pred_on_fc = []
-        fc_on_fc = []
+        # Group forecast results by learner index
+        fc_by_learner = defaultdict(list)
+        learner_idx = 0
         for i, learner in enumerate(learners_data):
             split_idx = max(1, int(len(learner["tasks"]) * frac))
             if split_idx >= len(learner["tasks"]):
                 continue
+            fc_by_learner[i] = []
+
+        fc_offset = 0
+        for i, learner in enumerate(learners_data):
+            split_idx = max(1, int(len(learner["tasks"]) * frac))
+            if split_idx >= len(learner["tasks"]):
+                continue
+            n_future = len(learner["tasks"]) - split_idx
+            for h in range(n_future):
+                if fc_offset < len(fc_results):
+                    fc_by_learner[i].append(fc_results[fc_offset])
+                    fc_offset += 1
+
+        pred_on_fc = []
+        fc_on_fc = []
+        for i in fc_by_learner:
+            split_idx = max(1, int(len(learners_data[i]["tasks"]) * frac))
             lookup = pred_by_learner[i]
-            source = learner["source"]
-            src_fc = [r for r in fc_results if r[3] == source]
-            for pred_fc, target_fc, horizon, _ in src_fc:
+            for pred_fc, target_fc, horizon, _ in fc_by_learner[i]:
                 pos = split_idx + horizon
                 if pos in lookup:
                     p_pred, t_pred = lookup[pos]
@@ -361,7 +625,6 @@ def main():
         m_fc = compute_metrics([p for p, _ in fc_on_fc], [t for _, t in fc_on_fc])
         print(f"  {frac:>7.0%} {'pred':>5} {fmt_metric(m_pred['bce']):>8} {fmt_metric(m_pred['accuracy']):>8} {fmt_metric(m_pred['mae']):>8} {fmt_metric(m_pred['auc']):>8}")
         print(f"  {'':>7} {'fc':>5} {fmt_metric(m_fc['bce']):>8} {fmt_metric(m_fc['accuracy']):>8} {fmt_metric(m_fc['mae']):>8} {fmt_metric(m_fc['auc']):>8}")
-        # Delta row
         deltas = {}
         for k in ["bce", "accuracy", "mae"]:
             if m_pred[k] is not None and m_fc[k] is not None:
@@ -451,7 +714,6 @@ def main():
             ax.set_ylim(0, 1)
             ax.set_aspect("equal")
             ax.grid(True, alpha=0.3)
-            # Add count annotations
             for mp, mt, c in zip(mean_preds, mean_targets, counts):
                 ax.annotate(f"n={c}", (mp, mt), textcoords="offset points",
                             xytext=(0, 8), ha="center", fontsize=7, color="gray")
@@ -496,7 +758,6 @@ def main():
             ax.set_ylabel("Accuracy")
             ax.set_title("Prediction Accuracy by History Length")
             ax.grid(True, alpha=0.3, axis="y")
-            # Add count annotations
             for i, (acc, n) in enumerate(zip(bin_accs, bin_ns)):
                 if acc is not None:
                     ax.annotate(f"n={n}", (i, acc), textcoords="offset points",
@@ -516,16 +777,14 @@ def main():
                 src_accs.append(m["accuracy"])
                 src_ns.append(m["n"])
             fig, ax = plt.subplots(figsize=(max(8, len(sources_sorted) * 0.5), 6))
-            bars = ax.barh(range(len(sources_sorted)), src_accs, color="tab:blue", alpha=0.7, edgecolor="white")
+            ax.barh(range(len(sources_sorted)), src_accs, color="tab:blue", alpha=0.7, edgecolor="white")
             ax.set_yticks(range(len(sources_sorted)))
-            labels = [s[:40] for s in sources_sorted]
-            ax.set_yticklabels(labels, fontsize=7)
+            ax.set_yticklabels(sources_sorted, fontsize=9)
             ax.set_xlabel("Accuracy")
             ax.set_title("Prediction Accuracy by Source")
             ax.axvline(overall_pred["accuracy"], color="red", linestyle="--", alpha=0.6, label=f"Overall: {overall_pred['accuracy']:.3f}")
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3, axis="x")
-            # Count annotations
             for i, (acc, n) in enumerate(zip(src_accs, src_ns)):
                 if acc is not None:
                     ax.annotate(f" n={n}", (acc, i), va="center", fontsize=7, color="gray")
@@ -589,7 +848,6 @@ def main():
 
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-            # Prediction: predicted vs ground truth (2D histogram)
             ax1.hist2d(preds_all, targets_all, bins=[np.linspace(0, 1, 50), [-0.1, 0.5, 1.1]],
                        cmap="Blues", cmin=1)
             ax1.set_xlabel("Predicted probability")
@@ -598,7 +856,6 @@ def main():
             ax1.set_yticks([0, 1])
             ax1.set_yticklabels(["0 (fail)", "1 (pass)"])
 
-            # Forecast: predicted vs ground truth (2D histogram)
             ax2.hist2d(fc_preds_rep, fc_targets_rep, bins=[np.linspace(0, 1, 50), [-0.1, 0.5, 1.1]],
                        cmap="Oranges", cmin=1)
             ax2.set_xlabel("Predicted probability")
@@ -614,7 +871,6 @@ def main():
         # --- Fig 8: ROC curve (prediction) ---
         if overall_pred["auc"] is not None:
             fig, ax = plt.subplots(figsize=(6, 6))
-            # Compute ROC points
             pairs = sorted(zip(preds_all, targets_all), key=lambda x: -x[0])
             n_pos = sum(1 for _, t in pairs if t >= 0.5)
             n_neg = len(pairs) - n_pos
@@ -648,9 +904,96 @@ def main():
             fig.savefig(f"{plot_dir}/roc_curve.png", dpi=150)
             plt.close(fig)
 
+        # --- Fig 9: Model vs Baselines comparison ---
+        methods = ["DFM"] + list(baseline_overall.keys())
+        method_metrics = [overall_pred] + [baseline_overall[bl] for bl in baseline_overall]
+        fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+        colors = ["tab:blue"] + ["tab:gray"] * len(baseline_overall)
+        for ax, metric, title in zip(axes, ["accuracy", "bce", "mae", "auc"],
+                                     ["Accuracy", "BCE", "MAE", "AUC"]):
+            values = [m.get(metric) for m in method_metrics]
+            valid = [(meth, v) for meth, v in zip(methods, values) if v is not None]
+            if not valid:
+                continue
+            meths, vals = zip(*valid)
+            c = colors[:len(meths)]
+            ax.barh(range(len(meths)), vals, color=c, alpha=0.7, edgecolor="white")
+            ax.set_yticks(range(len(meths)))
+            ax.set_yticklabels(meths)
+            ax.set_xlabel(title)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3, axis="x")
+            for i, v in enumerate(vals):
+                ax.annotate(f" {v:.3f}", (v, i), va="center", fontsize=8)
+        fig.suptitle("Model vs Baselines", fontsize=14, y=1.01)
+        fig.tight_layout()
+        fig.savefig(f"{plot_dir}/model_vs_baselines.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        # --- Fig 10: Per-source model vs running_avg ---
+        if per_source_pred and "running_avg" in baseline_per_learner:
+            bl_per_source = defaultdict(list)
+            for learner, results in zip(learners_data, baseline_per_learner["running_avg"]):
+                bl_per_source[learner["dataset_source"]].extend(results)
+
+            sources_sorted = sorted(per_source_pred.keys())
+            model_accs = []
+            bl_accs = []
+            for src in sources_sorted:
+                m_model = compute_metrics(
+                    [p for p, _, _ in per_source_pred[src]],
+                    [t for _, t, _ in per_source_pred[src]],
+                )
+                model_accs.append(m_model["accuracy"])
+                if src in bl_per_source:
+                    m_bl = compute_metrics(
+                        [r[0] for r in bl_per_source[src]],
+                        [r[1] for r in bl_per_source[src]],
+                    )
+                    bl_accs.append(m_bl["accuracy"])
+                else:
+                    bl_accs.append(None)
+
+            fig, ax = plt.subplots(figsize=(max(8, len(sources_sorted) * 0.8), 6))
+            y = range(len(sources_sorted))
+            ax.barh([i - 0.15 for i in y], model_accs, height=0.3, label="DFM", color="tab:blue", alpha=0.8)
+            bl_accs_valid = [v if v is not None else 0 for v in bl_accs]
+            ax.barh([i + 0.15 for i in y], bl_accs_valid, height=0.3, label="Running Avg", color="tab:orange", alpha=0.8)
+            ax.set_yticks(list(y))
+            ax.set_yticklabels(sources_sorted, fontsize=9)
+            ax.set_xlabel("Accuracy")
+            ax.set_title("DFM vs Running Average by Source")
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis="x")
+            fig.tight_layout()
+            fig.savefig(f"{plot_dir}/per_source_vs_baseline.png", dpi=150)
+            plt.close(fig)
+
         print(f"\n  Plots saved to {plot_dir}/")
     except ImportError:
-        print("\n  (matplotlib not installed — skipping plots)")
+        print("\n  (matplotlib not installed -- skipping plots)")
+
+    # ===================================================================
+    # JSON output
+    # ===================================================================
+    if args.output_json:
+        # Make all values JSON-serializable
+        def _clean(obj):
+            if isinstance(obj, dict):
+                return {k: _clean(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_clean(v) for v in obj]
+            if isinstance(obj, float):
+                if math.isnan(obj) or math.isinf(obj):
+                    return None
+                return round(obj, 6)
+            if hasattr(obj, "item"):  # torch/numpy scalar
+                return round(float(obj), 6)
+            return obj
+
+        with open(args.output_json, "w") as f:
+            json.dump(_clean(json_out), f, indent=2)
+        print(f"\n  JSON results saved to {args.output_json}")
 
     # ===================================================================
     # Summary
@@ -661,11 +1004,13 @@ def main():
     print(f"  Learners:         {len(learners_data)}")
     print(f"  Total steps:      {total_steps:,}")
     print(f"  Prediction time:  {pred_time:.1f}s")
-    total_fc_time = sum(t for _, _, t in forecast_summary)
     print(f"  Forecast time:    {total_fc_time:.1f}s (9 splits)")
     if overall_pred["accuracy"] is not None:
         print(f"  Prediction acc:   {overall_pred['accuracy']:.4f}")
-    # Best forecast accuracy across splits
+        # Show lift over best baseline
+        best_bl_acc = max(m["accuracy"] for m in baseline_overall.values() if m["accuracy"] is not None)
+        delta = overall_pred["accuracy"] - best_bl_acc
+        print(f"  vs best baseline: {delta:+.4f}")
     best_fc = max(forecast_summary, key=lambda x: x[1]["accuracy"] or 0)
     if best_fc[1]["accuracy"] is not None:
         print(f"  Best forecast:    {best_fc[1]['accuracy']:.4f} (prefix={best_fc[0]:.0%})")

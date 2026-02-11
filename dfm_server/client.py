@@ -51,6 +51,18 @@ class DFMClient:
         r.raise_for_status()
         return r.json()["predictions"]
 
+    def search(self, learner_id: str, target_tasks: list[str], candidate_tasks: list[str], depth: int, **ga_params) -> dict:
+        body = {
+            "learner_id": learner_id,
+            "target_tasks": target_tasks,
+            "candidate_tasks": candidate_tasks,
+            "depth": depth,
+            **ga_params,
+        }
+        r = requests.post(f"{self.url}/search", json=body)
+        r.raise_for_status()
+        return r.json()
+
     def delete(self, learner_id: str) -> dict:
         r = requests.delete(f"{self.url}/learners/{learner_id}")
         r.raise_for_status()

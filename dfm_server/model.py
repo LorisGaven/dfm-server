@@ -64,39 +64,95 @@ class BatchedKVCache:
     """KV cache forked from a single-sequence prefix into a batch of S sequences.
 
     Used for batched forecasting: all S sequences share the same prefix,
-    then diverge autoregressively. Only allocates prefix_len + extra_len slots.
+    then diverge autoregressively.
+
+    Memory optimization: the shared prefix is stored as a read-only view into the
+    source KVCache (zero allocation). Only the per-batch suffix is allocated.
+    insert_kv() produces a temporary concatenation per layer call, which the CUDA
+    caching allocator reuses across layers.
     """
 
     def __init__(self, source: KVCache, batch_size: int, extra_len: int):
         prefix_len = source.pos
-        total_len = prefix_len + extra_len
         n_layers, _, n_kv_head, _, head_dim = source.k.shape
         device, dtype = source.k.device, source.k.dtype
 
-        self.k = torch.zeros(n_layers, batch_size, n_kv_head, total_len, head_dim, device=device, dtype=dtype)
-        self.v = torch.zeros(n_layers, batch_size, n_kv_head, total_len, head_dim, device=device, dtype=dtype)
-
-        # Broadcast-copy the prefix (1 -> batch_size)
+        # View into source prefix (no copy, no allocation)
         if prefix_len > 0:
-            self.k[:, :, :, :prefix_len, :] = source.k[:, :, :, :prefix_len, :]
-            self.v[:, :, :, :prefix_len, :] = source.v[:, :, :, :prefix_len, :]
+            self.k_prefix = source.k[:, :, :, :prefix_len, :]
+            self.v_prefix = source.v[:, :, :, :prefix_len, :]
+        else:
+            self.k_prefix = None
+            self.v_prefix = None
 
-        self.pos = prefix_len
-        self.max_len = total_len
+        # Owned per-batch suffix
+        self.k_suffix = torch.zeros(n_layers, batch_size, n_kv_head, extra_len, head_dim, device=device, dtype=dtype)
+        self.v_suffix = torch.zeros(n_layers, batch_size, n_kv_head, extra_len, head_dim, device=device, dtype=dtype)
+
+        self.prefix_len = prefix_len
+        self.suffix_pos = 0
+        self.batch_size = batch_size
+        self.max_suffix_len = extra_len
 
     def insert_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         T_new = k.size(2)
-        end = self.pos + T_new
-        assert end <= self.max_len, f"BatchedKVCache overflow: {end} > {self.max_len}"
-        self.k[layer_idx, :, :, self.pos : end, :] = k
-        self.v[layer_idx, :, :, self.pos : end, :] = v
-        return self.k[layer_idx, :, :, :end, :], self.v[layer_idx, :, :, :end, :]
+        end = self.suffix_pos + T_new
+        assert end <= self.max_suffix_len, (
+            f"BatchedKVCache overflow: {self.prefix_len + end} > {self.prefix_len + self.max_suffix_len}"
+        )
+        self.k_suffix[layer_idx, :, :, self.suffix_pos : end, :] = k
+        self.v_suffix[layer_idx, :, :, self.suffix_pos : end, :] = v
+
+        suffix_k = self.k_suffix[layer_idx, :, :, :end, :]
+        suffix_v = self.v_suffix[layer_idx, :, :, :end, :]
+
+        if self.k_prefix is not None:
+            # expand is a stride-0 view (no copy); cat allocates a temporary
+            k_pre = self.k_prefix[layer_idx].expand(self.batch_size, -1, -1, -1)
+            v_pre = self.v_prefix[layer_idx].expand(self.batch_size, -1, -1, -1)
+            return torch.cat([k_pre, suffix_k], dim=2), torch.cat([v_pre, suffix_v], dim=2)
+        return suffix_k, suffix_v
 
     def get_pos(self) -> int:
-        return self.pos
+        return self.prefix_len + self.suffix_pos
 
     def advance(self, n: int):
-        self.pos += n
+        self.suffix_pos += n
+
+    @classmethod
+    def fork(cls, source: "BatchedKVCache", fan_out: int, extra_len: int) -> "BatchedKVCache":
+        """Fork each of the B sequences into fan_out copies -> B*fan_out batch.
+
+        Individual i's copies are at batch indices [i*fan_out, ..., i*fan_out+fan_out-1].
+        Inherits the prefix view (no copy). Only the suffix is repeat_interleaved.
+        """
+        B = source.batch_size
+        new_B = B * fan_out
+        n_layers, _, n_kv_head, _, head_dim = source.k_suffix.shape
+        device, dtype = source.k_suffix.device, source.k_suffix.dtype
+
+        obj = object.__new__(cls)
+
+        # Inherit prefix view (same reference, no copy)
+        obj.k_prefix = source.k_prefix
+        obj.v_prefix = source.v_prefix
+        obj.prefix_len = source.prefix_len
+
+        # New suffix: existing content + extra room
+        new_suffix_len = source.suffix_pos + extra_len
+        obj.k_suffix = torch.zeros(n_layers, new_B, n_kv_head, new_suffix_len, head_dim, device=device, dtype=dtype)
+        obj.v_suffix = torch.zeros(n_layers, new_B, n_kv_head, new_suffix_len, head_dim, device=device, dtype=dtype)
+
+        if source.suffix_pos > 0:
+            src_k = source.k_suffix[:, :, :, :source.suffix_pos, :]
+            src_v = source.v_suffix[:, :, :, :source.suffix_pos, :]
+            obj.k_suffix[:, :, :, :source.suffix_pos, :] = src_k.repeat_interleave(fan_out, dim=1)
+            obj.v_suffix[:, :, :, :source.suffix_pos, :] = src_v.repeat_interleave(fan_out, dim=1)
+
+        obj.suffix_pos = source.suffix_pos
+        obj.batch_size = new_B
+        obj.max_suffix_len = new_suffix_len
+        return obj
 
 
 # ---------------------------------------------------------------------------
