@@ -47,27 +47,6 @@ class DeleteResponse(BaseModel):
     learner_id: str
 
 
-class SearchRequest(BaseModel):
-    learner_id: str
-    target_tasks: list[str]
-    candidate_tasks: list[str]
-    depth: int
-    population_size: int = 64
-    generations: int = 20
-    elite_count: int = 4
-    tournament_size: int = 2
-    crossover_rate: float = 0.8
-    mutation_rate: float = 0.05
-    eval_every: int | None = None
-    seed: int | None = None
-
-
-class SearchResponse(BaseModel):
-    learner_id: str
-    best_sequence: list[str]
-    best_fitness: float
-
-
 class HealthResponse(BaseModel):
     status: str
     learner_count: int

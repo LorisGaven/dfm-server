@@ -3,12 +3,23 @@ DFM model (copied from dfm-training, inference-only) + KV cache for incremental 
 """
 
 import copy
-import math
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Suppress noisy HF loading messages (progress bars, load reports)
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["SAFETENSORS_FAST_GPU"] = "1"
+logging.getLogger("transformers").setLevel(logging.ERROR)
+import transformers.utils.logging as hf_logging  # noqa: E402
+
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
+from transformers import AutoModel, AutoTokenizer  # noqa: E402
 
 
 @dataclass
@@ -18,7 +29,16 @@ class DFMConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    n_input: int = 4096
+    encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    encoder_attn_implementation: str = "sdpa"
+    # Training-only fields (kept for checkpoint compatibility)
+    encoder_grad_batch_size: int = 64
+    encoder_nograd_batch_size: int = 4096
+
+
+def _mean_pool(last_hidden_state, attention_mask):
+    mask = attention_mask.unsqueeze(-1).float()
+    return (last_hidden_state * mask).sum(1) / mask.sum(1)
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +288,7 @@ class EmbeddingLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.output_dim = config.n_embd
-        self.task_proj = nn.Sequential(
-            nn.Linear(config.n_input, config.n_embd, bias=False),
-            nn.ReLU(),
-            nn.Linear(config.n_embd, config.n_embd, bias=False),
-        )
+        self.task_proj = nn.Linear(config.n_input, config.n_embd, bias=False)
         self.outcome_proj = nn.Linear(1, config.n_embd, bias=False)
         self.bos_task_emb = nn.Parameter(torch.randn(1, config.n_embd) * 0.02)
         self.bos_outcome_emb = nn.Parameter(torch.randn(1, config.n_embd) * 0.02)
@@ -311,11 +327,49 @@ class EmbeddingLayer(nn.Module):
 
 
 class DFM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, n_input=None):
+        """
+        Args:
+            config: DFMConfig
+            n_input: override encoder dim (skips encoder loading, for testing)
+        """
         super().__init__()
         self.config = copy.deepcopy(config)
         self.config.block_size = self.config.block_size * 2
-        self.embedding = EmbeddingLayer(self.config)
+
+        if n_input is not None:
+            # Testing mode: skip encoder loading
+            self.tokenizer = None
+            self.encoder = None
+        else:
+            # Load encoder and tokenizer
+            encoder_name = os.path.expanduser(config.encoder_name)
+            explicit_local_path = (
+                os.path.isabs(encoder_name)
+                or config.encoder_name.startswith(".")
+                or config.encoder_name.startswith("~")
+            )
+            local = explicit_local_path or os.path.isdir(encoder_name)
+            if explicit_local_path and not os.path.isdir(encoder_name):
+                raise FileNotFoundError(
+                    f"encoder_name points to a local path that does not exist: {encoder_name}"
+                )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                encoder_name, local_files_only=local
+            )
+            self.encoder = AutoModel.from_pretrained(
+                encoder_name,
+                local_files_only=local,
+                attn_implementation=self.config.encoder_attn_implementation,
+                dtype=torch.bfloat16,
+            )
+            n_input = self.encoder.config.hidden_size
+
+        # Store derived n_input on config for EmbeddingLayer
+        emb_config = copy.deepcopy(self.config)
+        emb_config.n_input = n_input
+
+        self.embedding = EmbeddingLayer(emb_config)
         self.transformer = nn.ModuleDict(
             {
                 "h": nn.ModuleList(
@@ -323,7 +377,7 @@ class DFM(nn.Module):
                 ),
             }
         )
-        self.prediction_head = nn.Linear(self.config.n_embd, 1, bias=False)
+        self.prediction_head = nn.Linear(self.config.n_embd, 2, bias=False)
         self.rotary_seq_len = self.config.block_size * 10
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -345,6 +399,35 @@ class DFM(nn.Module):
     def get_device(self):
         return self.embedding.outcome_proj.weight.device
 
+    @torch.no_grad()
+    def encode_tasks(self, task_strings: list[str], batch_size: int = 64) -> torch.Tensor:
+        """Encode task strings using the built-in sentence encoder.
+
+        Args:
+            task_strings: list of task strings to encode
+            batch_size: number of strings to encode per batch
+        Returns:
+            (N, encoder_dim) tensor in model dtype (bfloat16)
+        """
+        assert self.encoder is not None, "No encoder loaded (test mode?)"
+        model_dtype = self.embedding.task_proj.weight.dtype
+        all_embs = []
+        for i in range(0, len(task_strings), batch_size):
+            batch = task_strings[i : i + batch_size]
+            encoded = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(self.get_device())
+            attention_mask = encoded["attention_mask"].to(self.get_device())
+            out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            embs = _mean_pool(out.last_hidden_state, attention_mask)
+            all_embs.append(embs.to(dtype=model_dtype))
+        return torch.cat(all_embs, dim=0)
+
     def forward(self, tasks, outcomes, kv_cache=None):
         B, T, _ = tasks.shape
         x = self.embedding(tasks, outcomes)
@@ -362,11 +445,28 @@ class DFM(nn.Module):
         valid = outcomes >= 0
         valid_task_hiddens = task_hiddens[valid]
         valid_outcomes = outcomes[valid]
-        logits = self.prediction_head(valid_task_hiddens)
-        logits = logits.float()
-        logits = 15.0 * torch.tanh(logits / 15.0)
-        loss = F.binary_cross_entropy_with_logits(logits.view(-1), valid_outcomes.view(-1))
-        return logits, loss, x.detach()
+        raw = self.prediction_head(valid_task_hiddens)  # (N_valid, 2)
+        mean_logit = raw[:, 0].float()
+        conc_logit = raw[:, 1].float()
+        mean_logit = 15.0 * torch.tanh(mean_logit / 15.0)
+        conc_logit = 15.0 * torch.tanh(conc_logit / 15.0)
+        mu = torch.sigmoid(mean_logit)
+        nu = F.softplus(conc_logit) + 2.0
+        alpha = mu * nu
+        beta_param = (1.0 - mu) * nu
+        # beta-binomial NLL with n_trials=1
+        k = valid_outcomes
+        n = torch.ones_like(k)
+        log_prob = (
+            torch.lgamma(k + alpha)
+            + torch.lgamma(n - k + beta_param)
+            - torch.lgamma(n + alpha + beta_param)
+            - torch.lgamma(alpha)
+            - torch.lgamma(beta_param)
+            + torch.lgamma(alpha + beta_param)
+        )
+        loss = -log_prob.mean()
+        return mean_logit, loss, x.detach()
 
 
 # ---------------------------------------------------------------------------
@@ -424,17 +524,17 @@ def transformer_forward(model: DFM, x: torch.Tensor, kv_cache: KVCache) -> torch
 
 
 def predict_from_hidden(model: DFM, hidden: torch.Tensor) -> float:
-    """Apply prediction head + softcap -> probability.
+    """Apply prediction head -> mean probability.
 
     Args:
         hidden: (1, 1, n_embd) — hidden state at a task position
     Returns:
         probability as a Python float
     """
-    logit = model.prediction_head(hidden)  # (1, 1, 1)
-    logit = logit.float()
-    logit = 15.0 * torch.tanh(logit / 15.0)
-    return torch.sigmoid(logit).item()
+    raw = model.prediction_head(hidden)  # (1, 1, 2)
+    raw = raw.float()
+    mean_logit = 15.0 * torch.tanh(raw[..., 0] / 15.0)
+    return torch.sigmoid(mean_logit).item()
 
 
 # ---------------------------------------------------------------------------
@@ -458,14 +558,36 @@ def embed_outcome_tokens(model: DFM, outcomes: torch.Tensor) -> torch.Tensor:
 
 
 def predict_from_hiddens(model: DFM, hidden: torch.Tensor) -> torch.Tensor:
-    """Apply prediction head + softcap -> probabilities for a batch.
+    """Apply prediction head -> mean probabilities for a batch.
 
     Args:
         hidden: (B, 1, n_embd)
     Returns:
         (B,) float tensor of probabilities
     """
-    logits = model.prediction_head(hidden).squeeze(-1).squeeze(-1)  # (B,)
-    logits = logits.float()
-    logits = 15.0 * torch.tanh(logits / 15.0)
-    return torch.sigmoid(logits)
+    raw = model.prediction_head(hidden).squeeze(-2)  # (B, 2)
+    raw = raw.float()
+    mean_logit = 15.0 * torch.tanh(raw[:, 0] / 15.0)
+    return torch.sigmoid(mean_logit)
+
+
+def sample_from_hiddens(model: DFM, hidden: torch.Tensor) -> torch.Tensor:
+    """Sample outcomes from Beta(alpha, beta) for a batch.
+
+    Used in forecast autoregressive loop — samples from the full Beta distribution
+    rather than using the mean, to capture uncertainty in multi-step rollouts.
+
+    Args:
+        hidden: (B, 1, n_embd)
+    Returns:
+        (B,) float tensor of sampled outcomes
+    """
+    raw = model.prediction_head(hidden).squeeze(-2)  # (B, 2)
+    raw = raw.float()
+    mean_logit = 15.0 * torch.tanh(raw[:, 0] / 15.0)
+    conc_logit = 15.0 * torch.tanh(raw[:, 1] / 15.0)
+    mu = torch.sigmoid(mean_logit)
+    nu = F.softplus(conc_logit) + 2.0
+    alpha = mu * nu
+    beta_param = (1.0 - mu) * nu
+    return torch.distributions.Beta(alpha, beta_param).sample()  # (B,)

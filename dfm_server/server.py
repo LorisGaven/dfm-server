@@ -128,6 +128,7 @@ from .model import (
     embed_task_token,
     predict_from_hidden,
     predict_from_hiddens,
+    sample_from_hiddens,
     transformer_forward,
 )
 from .schemas import (
@@ -139,19 +140,16 @@ from .schemas import (
     PredictResponse,
     RegisterRequest,
     RegisterResponse,
-    SearchRequest,
-    SearchResponse,
     UpdateRequest,
     UpdateResponse,
 )
-from .search import run_search
 
 # ---------------------------------------------------------------------------
 # Global state (populated at startup)
 # ---------------------------------------------------------------------------
 model: DFM | None = None
 task_to_idx: dict[str, int] = {}
-emb_tensor: torch.Tensor | None = None  # (n_vocab+1, n_input), row 0 = BOS zeros
+emb_tensor: torch.Tensor | None = None  # (n_vocab+1, encoder_dim), row 0 = BOS zeros
 learners: dict[str, KVCache] = {}
 
 MAX_SEQ_LEN = 32768  # max interleaved tokens per learner
@@ -162,26 +160,22 @@ MAX_SEQ_LEN = 32768  # max interleaved tokens per learner
 # ---------------------------------------------------------------------------
 
 
-def load_model_and_embeddings(checkpoint_path: str, embeddings_path: str, device: str | None = None):
-    """Load checkpoint and embeddings."""
+def load_model(
+    checkpoint_path: str,
+    tasks_path: str,
+    device: str | None = None,
+    encode_batch_size: int = 64,
+):
+    """Load checkpoint and pre-encode tasks using the model's built-in encoder."""
+    import json
+
     global model, task_to_idx, emb_tensor
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    with console.status("[bold cyan]Loading embeddings...", spinner="dots") as status:
-        t0 = time.time()
-        emb_data = torch.load(embeddings_path, map_location="cpu", weights_only=True)
-        keys = emb_data["keys"]
-        embeddings = emb_data["embeddings"]
-        task_to_idx = {k: i + 1 for i, k in enumerate(keys)}
-        bos_row = torch.zeros(1, embeddings.shape[1], dtype=embeddings.dtype)
-        emb_tensor = torch.cat([bos_row, embeddings], dim=0).to(device=device, dtype=torch.bfloat16)
-        t_emb = time.time() - t0
-        console.log(f"[green]Loaded {len(keys):,} task embeddings[/] [dim]({t_emb:.1f}s)[/]")
-
-        status.update("[bold cyan]Loading model checkpoint...")
+    with console.status("[bold cyan]Loading model checkpoint...", spinner="dots") as status:
         t0 = time.time()
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         config = DFMConfig(**ckpt["model_args"])
@@ -201,8 +195,19 @@ def load_model_and_embeddings(checkpoint_path: str, embeddings_path: str, device
         t_move = time.time() - t0
         console.log(f"[green]Model ready on {device}[/] [dim]({t_move:.1f}s)[/]")
 
+        status.update("[bold cyan]Pre-encoding tasks...")
+        t0 = time.time()
+        with open(tasks_path) as f:
+            keys = json.load(f)
+        task_to_idx = {k: i + 1 for i, k in enumerate(keys)}
+        encoder_dim = model.encoder.config.hidden_size
+        bos_row = torch.zeros(1, encoder_dim, device=device, dtype=torch.bfloat16)
+        embeddings = model.encode_tasks(keys, batch_size=encode_batch_size)
+        emb_tensor = torch.cat([bos_row, embeddings], dim=0)
+        t_enc = time.time() - t0
+        console.log(f"[green]Encoded {len(keys):,} tasks[/] [dim]({t_enc:.1f}s)[/]")
+
     n_params = sum(p.numel() for p in model.parameters())
-    iter_num = ckpt.get("iter_num", "?")
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="bold")
@@ -211,9 +216,7 @@ def load_model_and_embeddings(checkpoint_path: str, embeddings_path: str, device
     table.add_row("Layers", str(config.n_layer))
     table.add_row("Heads", f"{config.n_head} Q / {config.n_kv_head} KV")
     table.add_row("Embedding dim", str(config.n_embd))
-    table.add_row("Input dim", str(config.n_input))
     table.add_row("Vocabulary", f"{len(keys):,} tasks")
-    table.add_row("Checkpoint", f"iter {iter_num}")
     table.add_row("Device", str(device))
     console.print(table)
 
@@ -227,9 +230,9 @@ async def lifespan(app):
     _req_t0 = time.time()
     # Only load real model if env vars are set (allows TestClient to skip)
     if "DFM_CHECKPOINT_PATH" in os.environ:
-        load_model_and_embeddings(
+        load_model(
             os.environ["DFM_CHECKPOINT_PATH"],
-            os.environ["DFM_EMBEDDINGS_PATH"],
+            os.environ["DFM_TASKS_PATH"],
             os.environ.get("DFM_DEVICE"),
         )
     yield
@@ -425,76 +428,18 @@ def forecast(req: ForecastRequest):
         # Embed task tokens → transformer forward → predict
         x = embed_task_token(model, step_embs)  # (S, 1, D)
         hidden = transformer_forward(model, x, batched_cache)  # (S, 1, D)
-        probs = predict_from_hiddens(model, hidden)  # (S,)
+        probs = predict_from_hiddens(model, hidden)  # (S,) — mean for output
+        sampled = sample_from_hiddens(model, hidden)  # (S,) — Beta sample for feedback
 
         for s in range(S):
             predictions[s].append(probs[s].item())
 
-        # Embed predicted outcomes → transformer forward (advance cache for next step)
-        x = embed_outcome_tokens(model, probs)  # (S, 1, D)
+        # Embed sampled outcomes → transformer forward (advance cache for next step)
+        x = embed_outcome_tokens(model, sampled)  # (S, 1, D)
         transformer_forward(model, x, batched_cache)
 
     # Original learner cache is untouched (we worked on a fork)
     return ForecastResponse(learner_id=req.learner_id, predictions=predictions)
-
-
-@app.post("/search", response_model=SearchResponse)
-@torch.no_grad()
-def search(req: SearchRequest):
-    kv_cache = get_learner(req.learner_id)
-
-    if req.depth <= 0:
-        raise HTTPException(status_code=400, detail="depth must be > 0")
-    if not req.target_tasks:
-        raise HTTPException(status_code=400, detail="target_tasks must not be empty")
-    if not req.candidate_tasks:
-        raise HTTPException(status_code=400, detail="candidate_tasks must not be empty")
-    if req.population_size < req.elite_count:
-        raise HTTPException(status_code=400, detail="population_size must be >= elite_count")
-    if kv_cache.pos + 2 * req.depth > MAX_SEQ_LEN:
-        raise HTTPException(status_code=400, detail="Search depth would exceed MAX_SEQ_LEN")
-
-    # Validate and look up target task indices
-    target_indices = []
-    for t in req.target_tasks:
-        idx = task_to_idx.get(t)
-        if idx is None:
-            raise HTTPException(status_code=400, detail=f"Unknown target task: '{t}'")
-        target_indices.append(idx)
-
-    # Validate and look up candidate task indices
-    candidate_indices = []
-    candidate_names = []
-    for t in req.candidate_tasks:
-        idx = task_to_idx.get(t)
-        if idx is None:
-            raise HTTPException(status_code=400, detail=f"Unknown candidate task: '{t}'")
-        candidate_indices.append(idx)
-        candidate_names.append(t)
-
-    best_sequence, best_fitness = run_search(
-        model=model,
-        kv_cache=kv_cache,
-        candidate_indices=candidate_indices,
-        target_indices=target_indices,
-        candidate_names=candidate_names,
-        emb_tensor=emb_tensor,
-        depth=req.depth,
-        population_size=req.population_size,
-        generations=req.generations,
-        elite_count=req.elite_count,
-        tournament_size=req.tournament_size,
-        crossover_rate=req.crossover_rate,
-        mutation_rate=req.mutation_rate,
-        eval_every=req.eval_every,
-        seed=req.seed,
-    )
-
-    return SearchResponse(
-        learner_id=req.learner_id,
-        best_sequence=best_sequence,
-        best_fitness=best_fitness,
-    )
 
 
 @app.delete("/learners/{learner_id}", response_model=DeleteResponse)
@@ -523,7 +468,7 @@ def get_config():
         "n_head": cfg.n_head,
         "n_kv_head": cfg.n_kv_head,
         "n_embd": cfg.n_embd,
-        "n_input": cfg.n_input,
+        "encoder_name": cfg.encoder_name,
         "block_size": cfg.block_size,
     }
 
@@ -554,8 +499,9 @@ LOGO = r"""
 def main():
     parser = argparse.ArgumentParser(description="DFM Inference Server")
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt)")
-    parser.add_argument("--embeddings", required=True, help="Path to embeddings file (.pt)")
+    parser.add_argument("--tasks", required=True, help="Path to tasks file (.json)")
     parser.add_argument("--device", default=None, help="Device (default: cuda if available)")
+    parser.add_argument("--encode-batch-size", type=int, default=64, help="Batch size for task pre-encoding")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -564,11 +510,11 @@ def main():
     _req_t0 = time.time()
 
     console.print(LOGO)
-    load_model_and_embeddings(args.checkpoint, args.embeddings, args.device)
+    load_model(args.checkpoint, args.tasks, args.device, args.encode_batch_size)
     console.print()
     console.rule("[bold green]Serving")
     console.print(f"  Listening on [bold]http://{args.host}:{args.port}[/]")
-    console.print(f"  Endpoints:   [cyan]/learners  /predict  /update  /forecast  /search  /tasks  /health[/]")
+    console.print(f"  Endpoints:   [cyan]/learners  /predict  /update  /forecast  /tasks  /health[/]")
     console.print()
 
     # Suppress uvicorn's default access/info logs — we have our own status line
