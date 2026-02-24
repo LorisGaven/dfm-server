@@ -27,29 +27,55 @@ class DFMClient:
         r.raise_for_status()
         return r.json()
 
-    def register(self, learner_id: str, tasks: list[str] | None = None, outcomes: list[float] | None = None) -> dict:
+    def register(
+        self,
+        learner_id: str,
+        tasks: list[str] | None = None,
+        outcomes: list[float] | None = None,
+        answers: list[str] | None = None,
+    ) -> dict:
         body = {"learner_id": learner_id}
         if tasks is not None:
             body["tasks"] = tasks
             body["outcomes"] = outcomes
+        if answers is not None:
+            body["answers"] = answers
         r = requests.post(f"{self.url}/learners", json=body)
         r.raise_for_status()
         return r.json()
 
-    def predict(self, learner_id: str, tasks: list[str]) -> list[float]:
-        r = requests.post(f"{self.url}/predict", json={"learner_id": learner_id, "tasks": tasks})
+    def predict(
+        self,
+        learner_id: str,
+        curriculum: list[list[str]] | None = None,
+        target_tasks: list[str] | None = None,
+    ) -> list[list[float]]:
+        body: dict = {"learner_id": learner_id}
+        if curriculum is not None:
+            body["curriculum"] = curriculum
+        if target_tasks is not None:
+            body["target_tasks"] = target_tasks
+        r = requests.post(f"{self.url}/predict", json=body)
         r.raise_for_status()
         return r.json()["predictions"]
 
-    def update(self, learner_id: str, task: str, outcome: float) -> dict:
-        r = requests.post(f"{self.url}/update", json={"learner_id": learner_id, "task": task, "outcome": outcome})
+    def update(
+        self,
+        learner_id: str,
+        tasks: list[str],
+        outcomes: list[float],
+        answers: list[str] | None = None,
+    ) -> dict:
+        body: dict = {
+            "learner_id": learner_id,
+            "tasks": tasks,
+            "outcomes": outcomes,
+        }
+        if answers is not None:
+            body["answers"] = answers
+        r = requests.post(f"{self.url}/update", json=body)
         r.raise_for_status()
         return r.json()
-
-    def forecast(self, learner_id: str, task_sequences: list[list[str]]) -> list[list[float]]:
-        r = requests.post(f"{self.url}/forecast", json={"learner_id": learner_id, "task_sequences": task_sequences})
-        r.raise_for_status()
-        return r.json()["predictions"]
 
     def delete(self, learner_id: str) -> dict:
         r = requests.delete(f"{self.url}/learners/{learner_id}")

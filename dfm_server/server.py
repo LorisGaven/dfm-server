@@ -1,16 +1,38 @@
 """FastAPI inference server for DFM."""
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from rich.console import Console
 from rich.table import Table
+
+from .model import (
+    BatchedKVCache,
+    DFM,
+    DFMConfig,
+    KVCache,
+    predict_from_hiddens,
+    transformer_forward,
+)
+from .schemas import (
+    DeleteResponse,
+    HealthResponse,
+    PredictRequest,
+    PredictResponse,
+    RegisterRequest,
+    RegisterResponse,
+    UpdateRequest,
+    UpdateResponse,
+)
 
 console = Console()
 
@@ -20,7 +42,9 @@ console = Console()
 _req_count = 0
 _req_t0 = 0.0
 _LOG_SIZE = 5
-_req_log: list[tuple[str, str, int, float, float]] = []  # (method, path, status, dt_ms, timestamp)
+_req_log: list[
+    tuple[str, str, int, float, float]
+] = []  # (method, path, status, dt_ms, timestamp)
 _frame_drawn = False
 
 # Box inner width (visible characters between │ and │)
@@ -117,42 +141,31 @@ def _status_line(method: str, path: str, status: int, dt_ms: float):
         _req_log.pop(0)
     _render_log()
 
-from .model import (
-    BatchedKVCache,
-    DFM,
-    DFMConfig,
-    KVCache,
-    embed_bos_task_token,
-    embed_outcome_token,
-    embed_outcome_tokens,
-    embed_task_token,
-    predict_from_hidden,
-    predict_from_hiddens,
-    sample_from_hiddens,
-    transformer_forward,
-)
-from .schemas import (
-    DeleteResponse,
-    ForecastRequest,
-    ForecastResponse,
-    HealthResponse,
-    PredictRequest,
-    PredictResponse,
-    RegisterRequest,
-    RegisterResponse,
-    UpdateRequest,
-    UpdateResponse,
-)
 
 # ---------------------------------------------------------------------------
 # Global state (populated at startup)
 # ---------------------------------------------------------------------------
 model: DFM | None = None
 task_to_idx: dict[str, int] = {}
-emb_tensor: torch.Tensor | None = None  # (n_vocab+1, encoder_dim), row 0 = BOS zeros
-learners: dict[str, KVCache] = {}
+task_emb_table: torch.Tensor | None = (
+    None  # (V+1, n_embd) pre-projected through task_proj
+)
+max_context_size: int = 512
+encode_batch_size: int = 64
 
-MAX_SEQ_LEN = 32768  # max interleaved tokens per learner
+MAX_SEQ_LEN = 32768  # max tokens per learner (context + curriculum + targets)
+
+
+@dataclass
+class LearnerState:
+    """Stores the last N (task, outcome, answer) entries for a learner."""
+
+    history: list[tuple[int, float, torch.Tensor | None]] = field(default_factory=list)
+    # Each entry: (task_idx, outcome, pre-projected_answer_emb or None)
+    # answer_emb is (n_embd,) already projected through answer_proj, or None if "[None]"
+
+
+learners: dict[str, LearnerState] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -164,27 +177,59 @@ def load_model(
     checkpoint_path: str,
     tasks_path: str,
     device: str | None = None,
-    encode_batch_size: int = 64,
+    max_context_size_: int = 512,
+    encode_batch_size_: int = 64,
 ):
-    """Load checkpoint and pre-encode tasks using the model's built-in encoder."""
-    import json
+    """Load checkpoint with trained encoder, tasks, and pre-encode task embeddings."""
+    global model, task_to_idx, task_emb_table, max_context_size, encode_batch_size
 
-    global model, task_to_idx, emb_tensor
+    max_context_size = max_context_size_
+    encode_batch_size = encode_batch_size_
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    with console.status("[bold cyan]Loading model checkpoint...", spinner="dots") as status:
+    with console.status(
+        "[bold cyan]Loading model checkpoint...", spinner="dots"
+    ) as status:
         t0 = time.time()
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         config = DFMConfig(**ckpt["model_args"])
         model = DFM(config)
+
+        # Create TextEncoder so encoder.* keys exist when loading state dict
+        enc_cfg = ckpt["encoder_config"]
+        # Suppress noisy logs and tqdm progress bars from transformers
+        for name in ("transformers", "huggingface_hub"):
+            logging.getLogger(name).setLevel(logging.WARNING)
+        with open(os.devnull, "w") as devnull:
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = devnull, devnull
+            try:
+                model.load_encoder(enc_cfg["model_name"], enc_cfg["max_length"])
+            finally:
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+
+        # Load full state dict (includes trained encoder.model.* weights)
         state_dict = ckpt["model"]
         cleaned = {}
         for k, v in state_dict.items():
             cleaned[k.removeprefix("module.").removeprefix("_orig_mod.")] = v
-        model.load_state_dict(cleaned)
+        result = model.load_state_dict(cleaned, strict=False)
+        if result.missing_keys:
+            console.log(
+                f"[yellow]Missing keys:[/] {result.missing_keys}"
+            )
+        unexpected = [
+            k for k in result.unexpected_keys
+            if not k.startswith(("task_embeddings", "answer_embeddings",
+                                 "task_token_ids", "task_attention_masks",
+                                 "answer_token_ids", "answer_attention_masks",
+                                 "task_embedding_cache", "answer_embedding_cache"))
+        ]
+        if unexpected:
+            console.log(f"[yellow]Unexpected keys:[/] {unexpected}")
         t_load = time.time() - t0
         console.log(f"[green]Loaded checkpoint[/] [dim]({t_load:.1f}s)[/]")
 
@@ -195,17 +240,40 @@ def load_model(
         t_move = time.time() - t0
         console.log(f"[green]Model ready on {device}[/] [dim]({t_move:.1f}s)[/]")
 
-        status.update("[bold cyan]Pre-encoding tasks...")
+        # Load tasks
+        status.update("[bold cyan]Loading tasks...")
         t0 = time.time()
         with open(tasks_path) as f:
-            keys = json.load(f)
-        task_to_idx = {k: i + 1 for i, k in enumerate(keys)}
-        encoder_dim = model.encoder.config.hidden_size
-        bos_row = torch.zeros(1, encoder_dim, device=device, dtype=torch.bfloat16)
-        embeddings = model.encode_tasks(keys, batch_size=encode_batch_size)
-        emb_tensor = torch.cat([bos_row, embeddings], dim=0)
-        t_enc = time.time() - t0
-        console.log(f"[green]Encoded {len(keys):,} tasks[/] [dim]({t_enc:.1f}s)[/]")
+            tasks_list = json.load(f)
+        task_to_idx = {t: i + 1 for i, t in enumerate(tasks_list)}
+        t_tasks = time.time() - t0
+        console.log(
+            f"[green]Loaded {len(tasks_list):,} tasks[/] [dim]({t_tasks:.1f}s)[/]"
+        )
+
+        # Encode all tasks with trained encoder
+        status.update("[bold cyan]Encoding tasks...")
+        t0 = time.time()
+        raw_task_embs = _encode_strings(tasks_list)  # (N, n_input)
+        t_encode = time.time() - t0
+        console.log(
+            f"[green]Encoded {len(tasks_list):,} tasks[/] [dim]({t_encode:.1f}s)[/]"
+        )
+
+        # Pre-project through task_proj
+        status.update("[bold cyan]Pre-projecting task embeddings...")
+        t0 = time.time()
+        n_input = raw_task_embs.shape[1]
+        bos_row = torch.zeros(
+            1, n_input, dtype=raw_task_embs.dtype, device=raw_task_embs.device
+        )
+        all_raw = torch.cat([bos_row, raw_task_embs], dim=0).to(
+            device=device, dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            task_emb_table = model.embedding.task_proj(all_raw)  # (N+1, n_embd)
+        t_proj = time.time() - t0
+        console.log(f"[green]Pre-projected embeddings[/] [dim]({t_proj:.1f}s)[/]")
 
     n_params = sum(p.numel() for p in model.parameters())
 
@@ -216,12 +284,12 @@ def load_model(
     table.add_row("Layers", str(config.n_layer))
     table.add_row("Heads", f"{config.n_head} Q / {config.n_kv_head} KV")
     table.add_row("Embedding dim", str(config.n_embd))
-    table.add_row("Vocabulary", f"{len(keys):,} tasks")
+    table.add_row("Input dim", str(n_input))
+    table.add_row("Encoder", enc_cfg["model_name"])
+    table.add_row("Vocabulary", f"{len(tasks_list):,} tasks")
+    table.add_row("Max context", str(max_context_size))
     table.add_row("Device", str(device))
     console.print(table)
-
-
-from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
@@ -234,6 +302,8 @@ async def lifespan(app):
             os.environ["DFM_CHECKPOINT_PATH"],
             os.environ["DFM_TASKS_PATH"],
             os.environ.get("DFM_DEVICE"),
+            int(os.environ.get("DFM_MAX_CONTEXT_SIZE", "512")),
+            int(os.environ.get("DFM_ENCODE_BATCH_SIZE", "64")),
         )
     yield
 
@@ -259,72 +329,157 @@ def get_device() -> torch.device:
     return model.get_device()
 
 
-def get_learner(learner_id: str) -> KVCache:
+def get_learner(learner_id: str) -> LearnerState:
     if learner_id not in learners:
         raise HTTPException(status_code=404, detail=f"Learner '{learner_id}' not found")
     return learners[learner_id]
 
 
-def lookup_task_embeddings(tasks: list[str]) -> torch.Tensor:
-    """Look up task embeddings by string name. Returns (1, T, n_input)."""
+def lookup_task_idx(task: str) -> int:
+    """Look up a task string's index. Raises 400 if unknown."""
+    idx = task_to_idx.get(task)
+    if idx is None:
+        raise HTTPException(status_code=400, detail=f"Unknown task: '{task}'")
+    return idx
+
+
+@torch.no_grad()
+def _encode_strings(strings: list[str]) -> torch.Tensor:
+    """Encode strings using the model's trained encoder.
+
+    Returns (N, n_input) tensor on the model's device in bfloat16.
+    """
+    device = get_device()
+    all_embs = []
+    for i in range(0, len(strings), encode_batch_size):
+        batch = strings[i : i + encode_batch_size]
+        tokens = model.encoder.tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=model.encoder.max_length,
+            return_tensors="pt",
+        ).to(device)
+        embs = model.encoder(
+            tokens["input_ids"].long(), tokens["attention_mask"].long()
+        )
+        all_embs.append(embs)
+    return torch.cat(all_embs, dim=0)
+
+
+def encode_answers(answer_strs: list[str]) -> list[torch.Tensor | None]:
+    """Encode answer strings in batch and project through answer_proj.
+
+    Returns list of (n_embd,) tensors, or None for "[None]" entries.
+    """
+    # Find non-None answers and their positions
+    to_encode = []
     indices = []
-    for t in tasks:
-        idx = task_to_idx.get(t)
-        if idx is None:
-            raise HTTPException(status_code=400, detail=f"Unknown task: '{t}'")
-        indices.append(idx)
-    idx_tensor = torch.tensor(indices, dtype=torch.long, device=get_device())
-    return emb_tensor[idx_tensor].unsqueeze(0)  # (1, T, n_input)
+    for i, s in enumerate(answer_strs):
+        if s != "[None]":
+            to_encode.append(s)
+            indices.append(i)
 
+    results: list[torch.Tensor | None] = [None] * len(answer_strs)
 
-def history_len_from_cache(kv_cache: KVCache) -> int:
-    """Number of (task, outcome) pairs in the cache, excluding BOS."""
-    # Cache position is in interleaved tokens: 2 for BOS pair + 2 per real pair
-    return (kv_cache.get_pos() // 2) - 1
+    if to_encode:
+        raw_embs = _encode_strings(to_encode)  # (M, n_input)
+        with torch.no_grad():
+            projected = model.embedding.answer_proj(raw_embs)  # (M, n_embd)
+        for j, idx in enumerate(indices):
+            results[idx] = projected[j]
 
-
-def new_kv_cache() -> KVCache:
-    return KVCache(
-        model.config,
-        max_len=MAX_SEQ_LEN,
-        device=get_device(),
-        dtype=torch.bfloat16,
-    )
+    return results
 
 
 @torch.no_grad()
-def prefill_bos(kv_cache: KVCache):
-    """Prefill a KV cache with the BOS (task, outcome) pair."""
-    bos_task = embed_bos_task_token(model)  # (1, 1, D)
-    bos_outcome = embed_outcome_token(model, outcome=0.0, is_bos=True)  # (1, 1, D)
-    x = torch.cat([bos_task, bos_outcome], dim=1)  # (1, 2, D)
-    transformer_forward(model, x, kv_cache)
+def build_context_and_prefill(learner: LearnerState) -> KVCache:
+    """Build context token sequence from learner history and prefill a KV cache.
 
-
-@torch.no_grad()
-def prefill_history(kv_cache: KVCache, task_embs: torch.Tensor, outcomes: list[float]):
-    """Prefill with BOS + history using the full model.forward() path.
-
-    This uses model.forward() which does the full EmbeddingLayer interleaving,
-    ensuring exact match with training behavior.
-
-    Args:
-        task_embs: (1, T, n_input) — task embeddings (BOS zeros already at position 0)
-        outcomes: length T — outcomes (-1 for BOS position)
+    Returns a fresh KVCache with the context prefilled.
     """
     device = get_device()
     dtype = torch.bfloat16
-    outcomes_t = torch.tensor([outcomes], dtype=torch.float32, device=device)
-    # Use model.forward() for the embedding + transformer pass
-    # This fills the kv_cache as a side effect
-    x = model.embedding(task_embs.to(dtype=dtype), outcomes_t)  # (1, 2*T, D)
-    seq_len = x.size(1)
-    T0 = kv_cache.get_pos()
-    cos_sin = model.cos[:, T0 : T0 + seq_len], model.sin[:, T0 : T0 + seq_len]
-    x = torch.nn.functional.rms_norm(x, (x.size(-1),))
-    for block in model.transformer.h:
-        x = block(x, cos_sin, kv_cache)
-    kv_cache.advance(seq_len)
+    D_embd = model.config.n_embd
+    # Count tokens: 1 BOS + per-entry (2 or 3 tokens)
+    n_tokens = 1
+    for _, _, answer_emb in learner.history:
+        n_tokens += 3 if answer_emb is not None else 2
+
+    # Allocate token type array
+    token_types = torch.zeros(1, n_tokens, dtype=torch.long, device=device)
+
+    # Position 0: BOS token (type=0 already from zeros init)
+    pos = 1
+    for _, _, answer_emb in learner.history:
+        token_types[0, pos] = 1  # TASK
+        pos += 1
+        token_types[0, pos] = 2  # OUTCOME
+        pos += 1
+        if answer_emb is not None:
+            token_types[0, pos] = 3  # ANSWER
+            pos += 1
+
+    # Since we have pre-projected task and answer embeddings, we need to build
+    # the embedded sequence manually (bypassing task_proj and answer_proj).
+    x = torch.zeros(1, n_tokens, D_embd, dtype=dtype, device=device)
+
+    # BOS: learned embedding
+    x[0, 0] = model.embedding.bos_emb.to(dtype)
+
+    pos = 1
+    for task_idx, outcome, answer_emb in learner.history:
+        # TASK: pre-projected task embedding from table
+        x[0, pos] = task_emb_table[task_idx]
+        pos += 1
+
+        # OUTCOME: project through outcome_proj
+        outcome_t = torch.tensor([[[outcome]]], dtype=dtype, device=device)
+        x[0, pos] = model.embedding.outcome_proj(outcome_t).squeeze()
+        pos += 1
+
+        # ANSWER: pre-projected answer embedding
+        if answer_emb is not None:
+            x[0, pos] = answer_emb
+            pos += 1
+
+    # Add type embeddings
+    x = x + model.embedding.type_emb(token_types).to(dtype)
+
+    # Create and prefill KV cache
+    kv_cache = KVCache(
+        model.config,
+        max_len=MAX_SEQ_LEN,
+        device=device,
+        dtype=dtype,
+    )
+    transformer_forward(model, x, kv_cache)
+    return kv_cache
+
+
+@torch.no_grad()
+def build_task_tokens(task_indices: list[int]) -> torch.Tensor:
+    """Build embedded TASK tokens from pre-projected task embedding table.
+
+    Args:
+        task_indices: list of task indices
+    Returns:
+        (1, T, n_embd) embedded tokens
+    """
+    device = get_device()
+    dtype = torch.bfloat16
+    T = len(task_indices)
+    D_embd = model.config.n_embd
+
+    x = torch.zeros(1, T, D_embd, dtype=dtype, device=device)
+    idx_tensor = torch.tensor(task_indices, dtype=torch.long, device=device)
+    x[0] = task_emb_table[idx_tensor]
+
+    # Add TASK type embedding (type=1)
+    type_emb = model.embedding.type_emb.weight[1].to(dtype)
+    x = x + type_emb
+
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -336,44 +491,118 @@ def prefill_history(kv_cache: KVCache, task_embs: torch.Tensor, outcomes: list[f
 @torch.no_grad()
 def register_learner(req: RegisterRequest):
     if req.learner_id in learners:
-        raise HTTPException(status_code=409, detail=f"Learner '{req.learner_id}' already exists")
+        raise HTTPException(
+            status_code=409, detail=f"Learner '{req.learner_id}' already exists"
+        )
 
-    kv_cache = new_kv_cache()
+    state = LearnerState()
 
     has_history = req.tasks is not None and req.outcomes is not None
     if has_history:
         if len(req.tasks) != len(req.outcomes):
-            raise HTTPException(status_code=400, detail="tasks and outcomes must have the same length")
-        # Build embedding tensor: BOS zeros + real task embeddings
-        bos_emb = torch.zeros(1, 1, emb_tensor.shape[1], device=get_device(), dtype=torch.bfloat16)
-        real_embs = lookup_task_embeddings(req.tasks)  # (1, T, n_input)
-        all_embs = torch.cat([bos_emb, real_embs], dim=1)  # (1, T+1, n_input)
-        all_outcomes = [-1.0] + req.outcomes
-        prefill_history(kv_cache, all_embs, all_outcomes)
-    else:
-        prefill_bos(kv_cache)
+            raise HTTPException(
+                status_code=400, detail="tasks and outcomes must have the same length"
+            )
+        answers = req.answers or ["[None]"] * len(req.tasks)
+        if len(answers) != len(req.tasks):
+            raise HTTPException(
+                status_code=400, detail="answers must have the same length as tasks"
+            )
 
-    learners[req.learner_id] = kv_cache
-    return RegisterResponse(learner_id=req.learner_id, history_len=history_len_from_cache(kv_cache))
+        answer_embs = encode_answers(answers)
+        for task_str, outcome, answer_emb in zip(req.tasks, req.outcomes, answer_embs):
+            task_idx = lookup_task_idx(task_str)
+            state.history.append((task_idx, outcome, answer_emb))
+
+        # Truncate to max context size
+        if len(state.history) > max_context_size:
+            state.history = state.history[-max_context_size:]
+
+    learners[req.learner_id] = state
+    return RegisterResponse(learner_id=req.learner_id, history_len=len(state.history))
 
 
 @app.post("/predict", response_model=PredictResponse)
 @torch.no_grad()
 def predict(req: PredictRequest):
-    kv_cache = get_learner(req.learner_id)
-    task_embs = lookup_task_embeddings(req.tasks)  # (1, T, n_input)
+    learner = get_learner(req.learner_id)
 
-    saved_pos = kv_cache.get_pos()
-    predictions = []
+    has_curriculum = req.curriculum is not None
+    has_targets = req.target_tasks is not None
 
-    for i in range(len(req.tasks)):
-        single_emb = task_embs[:, i : i + 1, :]  # (1, 1, n_input)
-        x = embed_task_token(model, single_emb)
-        hidden = transformer_forward(model, x, kv_cache)
-        p = predict_from_hidden(model, hidden)
-        predictions.append(p)
-        # Reset position — stale data beyond saved_pos will be overwritten next time
-        kv_cache.pos = saved_pos
+    if not has_curriculum and not has_targets:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of curriculum or target_tasks must be provided",
+        )
+
+    # Validate curriculum
+    S = 1  # default: single "curriculum" (no curriculum case)
+    L = 0
+    if has_curriculum:
+        S = len(req.curriculum)
+        if S == 0:
+            raise HTTPException(status_code=400, detail="curriculum must not be empty")
+        L = len(req.curriculum[0])
+        if any(len(seq) != L for seq in req.curriculum):
+            raise HTTPException(
+                status_code=400,
+                detail="All curriculum sequences must have the same length",
+            )
+
+    # Build context and prefill KV cache (batch=1)
+    kv_cache = build_context_and_prefill(learner)
+
+    if has_targets:
+        T = len(req.target_tasks)
+        target_indices = [lookup_task_idx(t) for t in req.target_tasks]
+
+        if has_curriculum and L > 0:
+            # Fork context to S for curriculum
+            batched_cache = BatchedKVCache(kv_cache, batch_size=S, extra_len=L)
+
+            # Build and forward curriculum tokens: (S, L, n_embd)
+            curriculum_x_list = []
+            for seq in req.curriculum:
+                indices = [lookup_task_idx(t) for t in seq]
+                curriculum_x_list.append(build_task_tokens(indices))
+            curriculum_x = torch.cat(curriculum_x_list, dim=0)  # (S, L, n_embd)
+            transformer_forward(model, curriculum_x, batched_cache)
+
+            # Fork S -> S*T so each target is independent per curriculum
+            target_cache = BatchedKVCache.fork(batched_cache, fan_out=T, extra_len=1)
+        else:
+            # No curriculum — fork context directly to S*T
+            # S=1 when no curriculum, so this gives T caches
+            target_cache = BatchedKVCache(kv_cache, batch_size=S * T, extra_len=1)
+
+        # Build target tokens: one token each, (S*T, 1, n_embd)
+        # Layout per curriculum s: [s_t0, s_t1, ..., s_tT-1]
+        target_x = build_task_tokens(target_indices)  # (1, T, n_embd)
+        target_x = target_x.expand(S, -1, -1).reshape(S * T, 1, -1)
+
+        hidden = transformer_forward(model, target_x, target_cache)  # (S*T, 1, n_embd)
+        preds = predict_from_hiddens(model, hidden).reshape(S, T)  # (S, T)
+
+        predictions = preds.tolist()
+    else:
+        # Curriculum only, predict at each curriculum position
+        # Fork context to S
+        batched_cache = BatchedKVCache(kv_cache, batch_size=S, extra_len=L)
+
+        # Build and forward curriculum tokens: (S, L, n_embd)
+        curriculum_x_list = []
+        for seq in req.curriculum:
+            indices = [lookup_task_idx(t) for t in seq]
+            curriculum_x_list.append(build_task_tokens(indices))
+        curriculum_x = torch.cat(curriculum_x_list, dim=0)  # (S, L, n_embd)
+
+        hidden = transformer_forward(
+            model, curriculum_x, batched_cache
+        )  # (S, L, n_embd)
+        preds = predict_from_hiddens(model, hidden)  # (S, L)
+
+        predictions = preds.tolist()
 
     return PredictResponse(learner_id=req.learner_id, predictions=predictions)
 
@@ -381,65 +610,28 @@ def predict(req: PredictRequest):
 @app.post("/update", response_model=UpdateResponse)
 @torch.no_grad()
 def update(req: UpdateRequest):
-    kv_cache = get_learner(req.learner_id)
-    task_emb = lookup_task_embeddings([req.task])  # (1, 1, n_input)
+    learner = get_learner(req.learner_id)
 
-    # Feed task token
-    x = embed_task_token(model, task_emb)
-    transformer_forward(model, x, kv_cache)
+    if len(req.tasks) != len(req.outcomes):
+        raise HTTPException(
+            status_code=400, detail="tasks and outcomes must have the same length"
+        )
+    answers = req.answers or ["[None]"] * len(req.tasks)
+    if len(answers) != len(req.tasks):
+        raise HTTPException(
+            status_code=400, detail="answers must have the same length as tasks"
+        )
 
-    # Feed outcome token
-    x = embed_outcome_token(model, req.outcome, is_bos=False)
-    transformer_forward(model, x, kv_cache)
+    answer_embs = encode_answers(answers)
+    for task_str, outcome, answer_emb in zip(req.tasks, req.outcomes, answer_embs):
+        task_idx = lookup_task_idx(task_str)
+        learner.history.append((task_idx, outcome, answer_emb))
 
-    return UpdateResponse(learner_id=req.learner_id, history_len=history_len_from_cache(kv_cache))
+    # Truncate to max context size
+    if len(learner.history) > max_context_size:
+        learner.history = learner.history[-max_context_size:]
 
-
-@app.post("/forecast", response_model=ForecastResponse)
-@torch.no_grad()
-def forecast(req: ForecastRequest):
-    kv_cache = get_learner(req.learner_id)
-    S = len(req.task_sequences)
-    if S == 0:
-        return ForecastResponse(learner_id=req.learner_id, predictions=[])
-    L = len(req.task_sequences[0])
-    if any(len(seq) != L for seq in req.task_sequences):
-        raise HTTPException(status_code=400, detail="All task sequences must have the same length")
-    if L == 0:
-        return ForecastResponse(learner_id=req.learner_id, predictions=[[] for _ in range(S)])
-
-    # Look up all embeddings: (S, L, n_input)
-    # Flatten all unique tasks, look up, then reshape
-    all_embs = []
-    for seq in req.task_sequences:
-        embs = lookup_task_embeddings(seq)  # (1, L, n_input)
-        all_embs.append(embs)
-    task_embs = torch.cat(all_embs, dim=0)  # (S, L, n_input)
-
-    # Fork KV cache: copies prefix, allocates space for 2*L new tokens (task+outcome per step)
-    batched_cache = BatchedKVCache(kv_cache, batch_size=S, extra_len=2 * L)
-
-    predictions = [[] for _ in range(S)]
-
-    for t in range(L):
-        # Task embeddings for step t: (S, 1, n_input)
-        step_embs = task_embs[:, t : t + 1, :]
-
-        # Embed task tokens → transformer forward → predict
-        x = embed_task_token(model, step_embs)  # (S, 1, D)
-        hidden = transformer_forward(model, x, batched_cache)  # (S, 1, D)
-        probs = predict_from_hiddens(model, hidden)  # (S,) — mean for output
-        sampled = sample_from_hiddens(model, hidden)  # (S,) — Beta sample for feedback
-
-        for s in range(S):
-            predictions[s].append(probs[s].item())
-
-        # Embed sampled outcomes → transformer forward (advance cache for next step)
-        x = embed_outcome_tokens(model, sampled)  # (S, 1, D)
-        transformer_forward(model, x, batched_cache)
-
-    # Original learner cache is untouched (we worked on a fork)
-    return ForecastResponse(learner_id=req.learner_id, predictions=predictions)
+    return UpdateResponse(learner_id=req.learner_id, history_len=len(learner.history))
 
 
 @app.delete("/learners/{learner_id}", response_model=DeleteResponse)
@@ -468,8 +660,9 @@ def get_config():
         "n_head": cfg.n_head,
         "n_kv_head": cfg.n_kv_head,
         "n_embd": cfg.n_embd,
-        "encoder_name": cfg.encoder_name,
+        "n_input": cfg.n_input,
         "block_size": cfg.block_size,
+        "max_context_size": max_context_size,
     }
 
 
@@ -490,7 +683,7 @@ LOGO = r"""
   [bold white]██████╗ ███████╗███╗   ███╗[/]
   [bold white]██╔══██╗██╔════╝████╗ ████║[/]
   [bold white]██║  ██║█████╗  ██╔████╔██║[/]  [bold white] ❀ Developmental Foundation Model[/]
-  [bold white]██║  ██║██╔══╝  ██║╚██╔╝██║[/]     [dim]── Inference Server v0.1.0 ──[/]
+  [bold white]██║  ██║██╔══╝  ██║╚██╔╝██║[/]     [dim]── Inference Server v0.2.0 ──[/]
   [bold white]██████╔╝██║     ██║ ╚═╝ ██║[/]
   [bold white]╚═════╝ ╚═╝     ╚═╝     ╚═╝[/]
 """
@@ -498,10 +691,25 @@ LOGO = r"""
 
 def main():
     parser = argparse.ArgumentParser(description="DFM Inference Server")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt)")
-    parser.add_argument("--tasks", required=True, help="Path to tasks file (.json)")
-    parser.add_argument("--device", default=None, help="Device (default: cuda if available)")
-    parser.add_argument("--encode-batch-size", type=int, default=64, help="Batch size for task pre-encoding")
+    parser.add_argument(
+        "--checkpoint", required=True, help="Path to model checkpoint (.pt)"
+    )
+    parser.add_argument("--tasks", required=True, help="Path to tasks list (.json)")
+    parser.add_argument(
+        "--max-context-size",
+        type=int,
+        default=8192,
+        help="Max history entries per learner",
+    )
+    parser.add_argument(
+        "--encode-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for encoding tasks at startup",
+    )
+    parser.add_argument(
+        "--device", default=None, help="Device (default: cuda if available)"
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -510,11 +718,19 @@ def main():
     _req_t0 = time.time()
 
     console.print(LOGO)
-    load_model(args.checkpoint, args.tasks, args.device, args.encode_batch_size)
+    load_model(
+        args.checkpoint,
+        args.tasks,
+        args.device,
+        args.max_context_size,
+        args.encode_batch_size,
+    )
     console.print()
     console.rule("[bold green]Serving")
     console.print(f"  Listening on [bold]http://{args.host}:{args.port}[/]")
-    console.print(f"  Endpoints:   [cyan]/learners  /predict  /update  /forecast  /tasks  /health[/]")
+    console.print(
+        "  Endpoints:   [cyan]/learners  /predict  /update  /tasks  /health[/]"
+    )
     console.print()
 
     # Suppress uvicorn's default access/info logs — we have our own status line

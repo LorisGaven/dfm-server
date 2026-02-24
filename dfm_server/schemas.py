@@ -5,6 +5,7 @@ class RegisterRequest(BaseModel):
     learner_id: str
     tasks: list[str] | None = None
     outcomes: list[float] | None = None
+    answers: list[str] | None = None
 
 
 class RegisterResponse(BaseModel):
@@ -14,33 +15,25 @@ class RegisterResponse(BaseModel):
 
 class PredictRequest(BaseModel):
     learner_id: str
-    tasks: list[str]
+    curriculum: list[list[str]] | None = None
+    target_tasks: list[str] | None = None
 
 
 class PredictResponse(BaseModel):
     learner_id: str
-    predictions: list[float]
+    predictions: list[list[float]]
 
 
 class UpdateRequest(BaseModel):
     learner_id: str
-    task: str
-    outcome: float
+    tasks: list[str]
+    outcomes: list[float]
+    answers: list[str] | None = None
 
 
 class UpdateResponse(BaseModel):
     learner_id: str
     history_len: int
-
-
-class ForecastRequest(BaseModel):
-    learner_id: str
-    task_sequences: list[list[str]]
-
-
-class ForecastResponse(BaseModel):
-    learner_id: str
-    predictions: list[list[float]]
 
 
 class DeleteResponse(BaseModel):
