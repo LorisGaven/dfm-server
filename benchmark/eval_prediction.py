@@ -80,7 +80,11 @@ def build_tables(
     results: list[dict],
     context_sizes: list[int],
     min_samples: int,
+    horizon_bins: list[tuple[int, int]] | None = None,
 ) -> tuple[Table, Table]:
+    if horizon_bins is None:
+        horizon_bins = HORIZON_BINS
+
     if not results:
         empty = Table(title="No data yet")
         return empty, empty
@@ -112,7 +116,7 @@ def build_tables(
     for col in ["Horizon", "MAE", "Acc", "AUC", "n_traj", "n"]:
         t2.add_column(col, justify="right")
 
-    for lo, hi in HORIZON_BINS:
+    for lo, hi in horizon_bins:
         mask = (hs >= lo) & (hs <= hi)
         n_traj = len(np.unique(sources[mask])) if mask.any() else 0
         if n_traj < min_samples:
@@ -131,9 +135,12 @@ def compute_matrices(
     results: list[dict],
     context_sizes: list[int],
     min_samples: int,
+    horizon_bins: list[tuple[int, int]] | None = None,
 ) -> dict[str, np.ndarray]:
+    if horizon_bins is None:
+        horizon_bins = HORIZON_BINS
     sorted_ks = sorted(context_sizes)
-    n_rows, n_cols = len(sorted_ks), len(HORIZON_BINS)
+    n_rows, n_cols = len(sorted_ks), len(horizon_bins)
     matrices = {name: np.full((n_rows, n_cols), np.nan) for name in METRIC_NAMES}
 
     if not results:
@@ -146,7 +153,7 @@ def compute_matrices(
     ks_arr, hs_arr, preds, truths = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
 
     for i, k in enumerate(sorted_ks):
-        for j, (lo, hi) in enumerate(HORIZON_BINS):
+        for j, (lo, hi) in enumerate(horizon_bins):
             mask = (ks_arr == k) & (hs_arr >= lo) & (hs_arr <= hi)
             n_traj = len(np.unique(sources[mask])) if mask.any() else 0
             if n_traj < min_samples:
@@ -160,17 +167,35 @@ def compute_matrices(
     return matrices
 
 
-def init_plot(context_sizes: list[int], interactive: bool = True) -> tuple:
+def init_plot(
+    context_sizes: list[int],
+    interactive: bool = True,
+    horizon_bins: list[tuple[int, int]] | None = None,
+) -> tuple:
+    if horizon_bins is None:
+        horizon_bins = HORIZON_BINS
     if interactive:
         plt.ion()
     else:
         plt.ioff()
+
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 11,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
     sorted_ks = sorted(context_sizes)
-    n_rows, n_cols = len(sorted_ks), len(HORIZON_BINS)
-    h_labels = [f"{lo}-{hi}" for lo, hi in HORIZON_BINS]
+    n_rows, n_cols = len(sorted_ks), len(horizon_bins)
+    h_labels = [f"{lo}\u2013{hi}" for lo, hi in horizon_bins]
     k_labels = [str(k) for k in sorted_ks]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.set_facecolor("white")
     images, texts = {}, {}
 
     for ax, name in zip(axes, METRIC_NAMES):
@@ -183,28 +208,48 @@ def init_plot(context_sizes: list[int], interactive: bool = True) -> tuple:
             vmax=vmax,
         )
         ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(h_labels, rotation=45, ha="right")
+        ax.set_xticklabels(h_labels, rotation=40, ha="right")
         ax.set_yticks(range(n_rows))
         ax.set_yticklabels(k_labels)
-        ax.set_xlabel("Horizon (h)")
-        ax.set_ylabel("Context size (K)")
+        ax.set_xlabel("Horizon")
+        ax.set_ylabel("Context Size (K)")
         ax.set_title(name)
-        fig.colorbar(im, ax=ax, shrink=0.8)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        cbar = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.03)
+        cbar.outline.set_visible(False)
+        cbar.ax.tick_params(labelsize=9, length=0)
         images[name] = im
 
         cell_texts = {}
         for i in range(n_rows):
             for j in range(n_cols):
                 cell_texts[(i, j)] = ax.text(
-                    j, i, "-", ha="center", va="center", color="gray", fontsize=8
+                    j, i, "", ha="center", va="center",
+                    color="#aaaaaa", fontsize=9, fontweight="medium",
                 )
         texts[name] = cell_texts
 
-    fig.suptitle("Prediction Evaluation: K \u00d7 Horizon", fontweight="bold")
-    fig.tight_layout()
+    fig.suptitle(
+        "Prediction Evaluation: Context Size \u00d7 Horizon",
+        fontsize=15, fontweight="bold", y=0.98,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
     return fig, axes, images, texts
+
+
+def _text_color(val, vmin, vmax, cmap_name):
+    """Pick white or dark text for readability on the cell background."""
+    import matplotlib.cm as cm
+    norm = (val - vmin) / (vmax - vmin) if vmax != vmin else 0.5
+    norm = max(0.0, min(1.0, norm))
+    r, g, b, _ = cm.get_cmap(cmap_name)(norm)
+    # Perceived luminance
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    return "white" if lum < 0.45 else "#222222"
 
 
 def update_plot(fig, images, texts, matrices):
@@ -218,19 +263,148 @@ def update_plot(fig, images, texts, matrices):
                 val = mat[i, j]
                 t = texts[name][(i, j)]
                 if np.isnan(val):
-                    t.set_text("-")
-                    t.set_color("gray")
+                    t.set_text("")
+                    t.set_color("#aaaaaa")
                 else:
                     t.set_text(f"{val:.3f}")
-                    t.set_color(
-                        "white" if abs(val - vmin) > 0.6 * (vmax - vmin) else "black"
-                    )
+                    t.set_color(_text_color(val, vmin, vmax, CMAPS[name]))
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
 
 
-def build_display(results, context_sizes, min_samples, progress_text) -> Table:
-    t1, t2 = build_tables(results, context_sizes, min_samples)
+DIST_BINS = np.linspace(0, 1, 11)  # 10 bins over [0, 1]
+DIST_COLOR = "#5A9BD5"
+
+
+def init_dist_plot(
+    context_sizes: list[int],
+    interactive: bool = True,
+    horizon_bins: list[tuple[int, int]] | None = None,
+) -> tuple:
+    if horizon_bins is None:
+        horizon_bins = HORIZON_BINS
+    if interactive:
+        plt.ion()
+    else:
+        plt.ioff()
+
+    sorted_ks = sorted(context_sizes)
+    n_rows, n_cols = len(sorted_ks), len(horizon_bins)
+    h_labels = [f"{lo}\u2013{hi}" for lo, hi in horizon_bins]
+    k_labels = [str(k) for k in sorted_ks]
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(2.2 * n_cols, 1.8 * n_rows),
+        sharex=True, sharey=True,
+        squeeze=False,
+    )
+    fig.set_facecolor("white")
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            ax = axes[i, j]
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.tick_params(labelsize=7, length=0)
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.5)
+                spine.set_color("#cccccc")
+            if i == n_rows - 1:
+                ax.set_xlabel(h_labels[j], fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"K={k_labels[i]}", fontsize=9)
+            if i == 0 and j == n_cols // 2:
+                ax.set_title("Horizon", fontsize=11, fontweight="bold")
+
+    fig.suptitle(
+        "Outcome Distribution per Cell",
+        fontsize=14, fontweight="bold", y=0.99,
+    )
+    fig.tight_layout(rect=[0.02, 0, 1, 0.94])
+    fig.canvas.draw_idle()
+    fig.canvas.flush_events()
+    return fig, axes
+
+
+def update_dist_plot(
+    fig,
+    axes,
+    results: list[dict],
+    context_sizes: list[int],
+    min_samples: int,
+    horizon_bins: list[tuple[int, int]] | None = None,
+):
+    if horizon_bins is None:
+        horizon_bins = HORIZON_BINS
+    if not results:
+        return
+
+    sorted_ks = sorted(context_sizes)
+    n_rows, n_cols = len(sorted_ks), len(horizon_bins)
+
+    arr = np.array(
+        [(r["K"], r["h"], r["truth"]) for r in results], dtype=np.float64
+    )
+    ks_arr, hs_arr, truths = arr[:, 0], arr[:, 1], arr[:, 2]
+    sources = np.array([r["source"] for r in results])
+
+    cell_freqs = {}
+    for i, k in enumerate(sorted_ks):
+        for j, (lo, hi) in enumerate(horizon_bins):
+            mask = (ks_arr == k) & (hs_arr >= lo) & (hs_arr <= hi)
+            n_traj = len(np.unique(sources[mask])) if mask.any() else 0
+            if n_traj < min_samples or not mask.any():
+                cell_freqs[(i, j)] = None
+                continue
+            counts, _ = np.histogram(truths[mask], bins=DIST_BINS)
+            total = counts.sum()
+            cell_freqs[(i, j)] = counts / total if total > 0 else counts
+
+    bin_width = DIST_BINS[1] - DIST_BINS[0]
+    bin_centers = (DIST_BINS[:-1] + DIST_BINS[1:]) / 2
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            ax = axes[i, j]
+            ax.clear()
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1.08)
+            ax.tick_params(labelsize=7, length=0)
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.5)
+                spine.set_color("#cccccc")
+
+            freqs = cell_freqs.get((i, j))
+            if freqs is not None:
+                ax.bar(
+                    bin_centers, freqs, width=bin_width * 0.88,
+                    color=DIST_COLOR, edgecolor="white", linewidth=0.4,
+                )
+            else:
+                ax.text(
+                    0.5, 0.5, "n/a", ha="center", va="center",
+                    transform=ax.transAxes, color="#aaaaaa", fontsize=9,
+                )
+
+            # Restore labels
+            h_labels = [f"{lo}\u2013{hi}" for lo, hi in horizon_bins]
+            k_labels = [str(k) for k in sorted_ks]
+            if i == n_rows - 1:
+                ax.set_xlabel(h_labels[j], fontsize=9)
+            else:
+                ax.set_xticklabels([])
+            if j == 0:
+                ax.set_ylabel(f"K={k_labels[i]}", fontsize=9)
+            else:
+                ax.set_yticklabels([])
+
+    fig.canvas.draw_idle()
+    fig.canvas.flush_events()
+
+
+def build_display(results, context_sizes, min_samples, progress_text, horizon_bins=None) -> Table:
+    t1, t2 = build_tables(results, context_sizes, min_samples, horizon_bins)
     layout = Table.grid(padding=1)
     layout.add_row(Text(progress_text, style="bold cyan"))
     layout.add_row(t1)
@@ -239,7 +413,6 @@ def build_display(results, context_sizes, min_samples, progress_text) -> Table:
 
 
 def run(args):
-    client = DFMClient(args.server_url)
     all_trajectories = load_trajectories(args.data)
     if args.filter:
         all_trajectories = [
@@ -249,6 +422,9 @@ def run(args):
     context_sizes = args.context_sizes
     max_horizon = args.max_horizon
     min_samples = args.min_samples
+    baseline = args.baseline
+
+    horizon_bins = [(lo, hi) for lo, hi in HORIZON_BINS if lo <= max_horizon]
 
     min_length = max(context_sizes) + max_horizon
     trajectories = [t for t in all_trajectories if len(t["tasks"]) >= min_length]
@@ -265,11 +441,20 @@ def run(args):
         )
         return
 
+    if baseline:
+        mean_outcome = float(np.mean([
+            o for t in trajectories for o in t["outcomes"]
+        ]))
+        console.print(f"[bold]Baseline mode:[/bold] predicting constant {mean_outcome:.4f}")
+    else:
+        client = DFMClient(args.server_url)
+
     show_plot = not args.save
     results: list[dict] = []
 
     if show_plot:
-        fig, axes, images, texts = init_plot(context_sizes)
+        fig, axes, images, texts = init_plot(context_sizes, horizon_bins=horizon_bins)
+        dist_fig, dist_axes = init_dist_plot(context_sizes, horizon_bins=horizon_bins)
 
     rng = np.random.default_rng(seed=42)
 
@@ -292,66 +477,87 @@ def run(args):
             fut_tasks = all_tasks[p : p + max_horizon]
             fut_outcomes = all_outcomes[p : p + max_horizon]
 
-            for K in context_sizes:
+            if baseline:
+                # Batch all K values at once — no server calls
+                for K in context_sizes:
+                    for h_idx, truth in enumerate(fut_outcomes):
+                        results.append(
+                            {
+                                "K": K,
+                                "h": h_idx + 1,
+                                "pred": mean_outcome,
+                                "truth": truth,
+                                "source": traj_id,
+                            }
+                        )
                 progress = (
-                    f"Trajectory {ti + 1}/{len(trajectories)} | "
-                    f"context={K} | split={p}"
+                    f"[Baseline] Trajectory {ti + 1}/{len(trajectories)} | split={p}"
                 )
                 live.update(
-                    build_display(results, context_sizes, min_samples, progress)
-                )
-
-                learner_id = str(uuid.uuid4())
-
-                try:
-                    # Register with K history steps ending at the split point
-                    if K > 0:
-                        ctx_tasks = all_tasks[p - K : p]
-                        ctx_outcomes = all_outcomes[p - K : p]
-                        ctx_answers = (
-                            all_answers[p - K : p] if all_answers else None
-                        )
-                        client.register(
-                            learner_id,
-                            tasks=ctx_tasks,
-                            outcomes=ctx_outcomes,
-                            answers=ctx_answers,
-                        )
-                    else:
-                        client.register(learner_id)
-
-                    # Predict future tasks (single deterministic forward pass)
-                    preds = client.predict(learner_id, curriculum=[fut_tasks])[0]
-                finally:
-                    try:
-                        client.delete(learner_id)
-                    except Exception:
-                        pass
-
-                # Collect results
-                for h_idx, (pred, truth) in enumerate(
-                    zip(preds, fut_outcomes)
-                ):
-                    results.append(
-                        {
-                            "K": K,
-                            "h": h_idx + 1,
-                            "pred": pred,
-                            "truth": truth,
-                            "source": traj_id,
-                        }
-                    )
-
-                live.update(
-                    build_display(results, context_sizes, min_samples, progress)
+                    build_display(results, context_sizes, min_samples, progress, horizon_bins)
                 )
                 if show_plot:
-                    matrices = compute_matrices(results, context_sizes, min_samples)
+                    matrices = compute_matrices(results, context_sizes, min_samples, horizon_bins)
                     update_plot(fig, images, texts, matrices)
+                    update_dist_plot(dist_fig, dist_axes, results, context_sizes, min_samples, horizon_bins)
+            else:
+                for K in context_sizes:
+                    progress = (
+                        f"Trajectory {ti + 1}/{len(trajectories)} | "
+                        f"context={K} | split={p}"
+                    )
+                    live.update(
+                        build_display(results, context_sizes, min_samples, progress, horizon_bins)
+                    )
+
+                    learner_id = str(uuid.uuid4())
+                    try:
+                        if K > 0:
+                            ctx_tasks = all_tasks[p - K : p]
+                            ctx_outcomes = all_outcomes[p - K : p]
+                            ctx_answers = (
+                                all_answers[p - K : p] if all_answers else None
+                            )
+                            client.register(
+                                learner_id,
+                                tasks=ctx_tasks,
+                                outcomes=ctx_outcomes,
+                                answers=ctx_answers,
+                            )
+                        else:
+                            client.register(learner_id)
+
+                        preds = client.predict(learner_id, curriculum=[fut_tasks])[0]
+                    finally:
+                        try:
+                            client.delete(learner_id)
+                        except Exception:
+                            pass
+
+                    for h_idx, (pred, truth) in enumerate(
+                        zip(preds, fut_outcomes)
+                    ):
+                        results.append(
+                            {
+                                "K": K,
+                                "h": h_idx + 1,
+                                "pred": pred,
+                                "truth": truth,
+                                "source": traj_id,
+                            }
+                        )
+
+                    live.update(
+                        build_display(results, context_sizes, min_samples, progress, horizon_bins)
+                    )
+                    if show_plot:
+                        matrices = compute_matrices(results, context_sizes, min_samples, horizon_bins)
+                        update_plot(fig, images, texts, matrices)
+                        update_dist_plot(dist_fig, dist_axes, results, context_sizes, min_samples, horizon_bins)
 
     # Final display
     console.print()
-    t1, t2 = build_tables(results, context_sizes, min_samples)
+    t1, t2 = build_tables(results, context_sizes, min_samples, horizon_bins)
     console.print(t1)
     console.print(t2)
     console.print(f"\nTotal samples: {len(results)}")
@@ -365,13 +571,20 @@ def run(args):
             writer.writerows(results)
         console.print(f"Saved {len(results)} rows to {save_path}")
 
-        fig, axes, images, texts = init_plot(context_sizes, interactive=False)
-        matrices = compute_matrices(results, context_sizes, min_samples)
+        fig, axes, images, texts = init_plot(context_sizes, interactive=False, horizon_bins=horizon_bins)
+        matrices = compute_matrices(results, context_sizes, min_samples, horizon_bins)
         update_plot(fig, images, texts, matrices)
         fig_path = save_path.with_suffix(".png")
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         console.print(f"Saved plot to {fig_path}")
+
+        dist_fig, dist_axes = init_dist_plot(context_sizes, interactive=False, horizon_bins=horizon_bins)
+        update_dist_plot(dist_fig, dist_axes, results, context_sizes, min_samples, horizon_bins)
+        dist_path = save_path.with_name(save_path.stem + "_dist.png")
+        dist_fig.savefig(dist_path, dpi=150, bbox_inches="tight")
+        plt.close(dist_fig)
+        console.print(f"Saved distribution plot to {dist_path}")
     else:
         plt.ioff()
         plt.show()
@@ -407,6 +620,11 @@ def main():
         type=str,
         nargs="+",
         help="Only use trajectories whose source contains any of these keywords",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Run mean-outcome baseline instead of the DFM server",
     )
 
     args = parser.parse_args()
