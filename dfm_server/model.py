@@ -20,7 +20,7 @@ class DFMConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    n_input: int = 4096
+    n_input: int = 1024
 
 
 class TextEncoder(nn.Module):
@@ -48,7 +48,9 @@ class TextEncoder(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask):
-        x = self.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        x = self.model(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).last_hidden_state
         mask = attention_mask.unsqueeze(-1).to(x.dtype)
         return (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
@@ -544,9 +546,7 @@ class DFM(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def _precompute_rotary_embeddings(
-        self, seq_len, head_dim, base=100000, device=None
-    ):
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
             device = self.embedding.outcome_proj.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -594,15 +594,8 @@ class DFM(nn.Module):
 
         # Pass through embedding layer
         x = self.embedding(token_types, task_embs, answer_embs, outcome_values)
-        seq_len = x.size(1)
 
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0 : T0 + seq_len], self.sin[:, T0 : T0 + seq_len]
-
-        x = norm(x)
-        for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
-        x = norm(x)
+        x = transformer_forward(self, x, kv_cache)
 
         # Loss mask: TASK positions (type 1) with valid targets
         valid_mask = (token_types == 1) & (target_outcomes >= 0)
@@ -622,45 +615,27 @@ class DFM(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def embed_tokens(
-    model: DFM,
-    token_types: torch.Tensor,
-    task_embs: torch.Tensor,
-    answer_embs: torch.Tensor,
-    outcome_values: torch.Tensor,
-) -> torch.Tensor:
-    """Embed tokens via the model's EmbeddingLayer.
-
-    Args:
-        token_types: (B, T) int
-        task_embs: (B, T, n_input) or (B, T, n_embd) if pre-projected
-        answer_embs: (B, T, n_input) or (B, T, n_embd) if pre-projected
-        outcome_values: (B, T) float
-    Returns:
-        (B, T, n_embd)
-    """
-    return model.embedding(token_types, task_embs, answer_embs, outcome_values)
-
-
-def transformer_forward(model: DFM, x: torch.Tensor, kv_cache) -> torch.Tensor:
+def transformer_forward(model: DFM, x: torch.Tensor, kv_cache=None) -> torch.Tensor:
     """Run embedded token(s) through the transformer blocks and advance cache.
 
     Args:
         x: (B, T, n_embd) — already embedded tokens
-        kv_cache: the learner's KV cache (KVCache or BatchedKVCache)
+        kv_cache: the learner's KV cache (KVCache, BatchedKVCache, or None)
     Returns:
         hidden: (B, T, n_embd)
     """
     T = x.size(1)
-    T0 = kv_cache.get_pos()
+    T0 = 0 if kv_cache is None else kv_cache.get_pos()
     cos_sin = model.cos[:, T0 : T0 + T], model.sin[:, T0 : T0 + T]
 
+    x_input = x
     x = norm(x)
     for block in model.transformer.h:
-        x = block(x, cos_sin, kv_cache)
+        x = block(x, cos_sin, kv_cache) + x_input
     x = norm(x)
 
-    kv_cache.advance(T)
+    if kv_cache is not None:
+        kv_cache.advance(T)
     return x
 
 

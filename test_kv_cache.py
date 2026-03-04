@@ -7,7 +7,6 @@ from dfm_server.model import (
     DFM,
     DFMConfig,
     KVCache,
-    norm,
     transformer_forward,
 )
 
@@ -40,13 +39,7 @@ def make_model():
 
 def naive_forward(model, x):
     """Full-sequence forward pass without KV cache. Returns hidden states (B, T, D)."""
-    T = x.size(1)
-    cos_sin = model.cos[:, :T], model.sin[:, :T]
-    h = norm(x)
-    for block in model.transformer.h:
-        h = block(h, cos_sin, kv_cache=None)
-    h = norm(h)
-    return h
+    return transformer_forward(model, x, kv_cache=None)
 
 
 def random_embeddings(B, T):
