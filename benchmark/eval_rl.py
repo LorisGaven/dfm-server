@@ -265,7 +265,7 @@ def _plot_heatmap(matrix, context_sizes, horizon_sizes, save_dir):
     ax.set_xlabel("Horizon (task-only tokens)", fontsize=12)
     ax.set_ylabel("Context size (full history)", fontsize=12)
     ax.set_title(
-        "DFM Prediction MAE: Context × Horizon", fontsize=14, fontweight="bold"
+        "Prediction MAE: Context × Horizon", fontsize=14, fontweight="bold"
     )
 
     cbar = fig.colorbar(im, ax=ax, label="MAE")

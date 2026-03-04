@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=dfm-eval-rl
+#SBATCH --job-name=dfm-eval-llm
 #SBATCH --time=02:00:00
-#SBATCH --output=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl.out
-#SBATCH --error=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl.err
+#SBATCH --output=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-llm.out
+#SBATCH --error=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-llm.err
 #SBATCH --qos=qos_gpu_h100-dev
 #SBATCH -C h100
 #SBATCH --gres=gpu:1
