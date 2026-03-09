@@ -108,7 +108,7 @@ def run(args):
 
     # Accumulate results: (C, H) -> list of MAE values across eval steps
     matrix_acc = defaultdict(list)
-    raw_results = []  # (context, horizon, step, mae)
+    raw_results = []  # (context, horizon, step, task, actual, predicted)
 
     total_eval_steps = len(eval_files)
     for step_idx, (step, eval_path) in enumerate(eval_files):
@@ -173,7 +173,10 @@ def run(args):
                     mae = float(np.mean(np.abs(preds_arr - eval_outcomes)))
 
                     matrix_acc[(C, H)].append(mae)
-                    raw_results.append((C, H, step, mae))
+                    for task, actual, predicted in zip(
+                        eval_tasks, eval_outcomes.tolist(), preds_arr.tolist()
+                    ):
+                        raw_results.append((C, H, step, task, actual, predicted))
 
                     cell_idx += 1
                     console.print(
@@ -214,91 +217,24 @@ def run(args):
         save_dir = Path(args.save)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Raw CSV
+        # Raw per-task CSV
         csv_path = save_dir / "results.csv"
         with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["context", "horizon", "step", "mae"])
+            fields = ["context", "horizon", "step", "task", "actual", "predicted"]
+            writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
-            for C, H, step, mae in raw_results:
-                writer.writerow({"context": C, "horizon": H, "step": step, "mae": mae})
+            for C, H, step, task, actual, predicted in raw_results:
+                writer.writerow(
+                    {
+                        "context": C,
+                        "horizon": H,
+                        "step": step,
+                        "task": task,
+                        "actual": actual,
+                        "predicted": predicted,
+                    }
+                )
         console.print(f"Saved {len(raw_results)} rows to {csv_path}")
-
-        # Averaged matrix CSV
-        matrix_csv_path = save_dir / "matrix.csv"
-        with open(matrix_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["context\\horizon"] + [str(H) for H in horizon_sizes])
-            for ci, C in enumerate(context_sizes):
-                row = [str(C)]
-                for hi in range(len(horizon_sizes)):
-                    val = matrix[ci, hi]
-                    row.append(f"{val:.4f}" if not np.isnan(val) else "")
-                writer.writerow(row)
-        console.print(f"Saved averaged matrix to {matrix_csv_path}")
-
-        # Heatmap
-        _plot_heatmap(matrix, context_sizes, horizon_sizes, save_dir)
-        console.print(f"Saved heatmap to {save_dir / 'matrix.png'}")
-
-
-def _plot_heatmap(matrix, context_sizes, horizon_sizes, save_dir):
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    # Mask NaN cells
-    masked = np.ma.masked_where(np.isnan(matrix), matrix)
-
-    im = ax.pcolormesh(
-        horizon_sizes + [horizon_sizes[-1] + (horizon_sizes[1] - horizon_sizes[0])],
-        context_sizes
-        + [
-            context_sizes[-1] + (context_sizes[1] - context_sizes[0])
-            if len(context_sizes) > 1
-            else context_sizes[-1] + 256
-        ],
-        masked,
-        cmap="RdYlGn_r",
-        shading="flat",
-    )
-
-    ax.set_xlabel("Horizon (task-only tokens)", fontsize=12)
-    ax.set_ylabel("Context size (full history)", fontsize=12)
-    ax.set_title(
-        "Prediction MAE: Context × Horizon", fontsize=14, fontweight="bold"
-    )
-
-    cbar = fig.colorbar(im, ax=ax, label="MAE")
-    cbar.ax.tick_params(labelsize=10)
-
-    # Add text annotations for non-NaN cells
-    for ci in range(len(context_sizes)):
-        for hi in range(len(horizon_sizes)):
-            val = matrix[ci, hi]
-            if not np.isnan(val):
-                x = (
-                    horizon_sizes[hi] + (horizon_sizes[1] - horizon_sizes[0]) / 2
-                    if len(horizon_sizes) > 1
-                    else horizon_sizes[hi]
-                )
-                y = (
-                    context_sizes[ci] + (context_sizes[1] - context_sizes[0]) / 2
-                    if len(context_sizes) > 1
-                    else context_sizes[ci]
-                )
-                ax.text(
-                    x,
-                    y,
-                    f"{val:.3f}",
-                    ha="center",
-                    va="center",
-                    fontsize=6,
-                    color="white" if val > np.nanmedian(matrix) else "black",
-                )
-
-    fig.tight_layout()
-    fig.savefig(save_dir / "matrix.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 def main():
