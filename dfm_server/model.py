@@ -628,15 +628,64 @@ def transformer_forward(model: DFM, x: torch.Tensor, kv_cache=None) -> torch.Ten
     T0 = 0 if kv_cache is None else kv_cache.get_pos()
     cos_sin = model.cos[:, T0 : T0 + T], model.sin[:, T0 : T0 + T]
 
-    x_input = x
     x = norm(x)
     for block in model.transformer.h:
-        x = block(x, cos_sin, kv_cache) + x_input
+        x = block(x, cos_sin, kv_cache)
     x = norm(x)
 
     if kv_cache is not None:
         kv_cache.advance(T)
     return x
+
+
+def extract_attention_weights(model: DFM, x: torch.Tensor) -> list[torch.Tensor]:
+    """Run a forward pass without KV cache and return per-layer attention weights.
+
+    Args:
+        x: (1, T, n_embd) — already embedded tokens
+    Returns:
+        list of (n_head, T, T) attention weight tensors, one per layer
+    """
+    T = x.size(1)
+    cos_sin = model.cos[:, :T], model.sin[:, :T]
+    scale = model.config.n_embd // model.config.n_head
+
+    attn_weights = []
+    x = norm(x)
+    for block in model.transformer.h:
+        # Compute attention weights manually for this block
+        x_norm = norm(x)
+        attn = block.attn
+        q = attn.c_q(x_norm).view(1, T, attn.n_head, attn.head_dim)
+        k = attn.c_k(x_norm).view(1, T, attn.n_kv_head, attn.head_dim)
+        v = attn.c_v(x_norm).view(1, T, attn.n_kv_head, attn.head_dim)
+
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        nrep = attn.n_head // attn.n_kv_head
+        k_rep, v_rep = repeat_kv(k, nrep), repeat_kv(v, nrep)
+
+        # Manual attention: (1, n_head, T, T)
+        scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (scale**0.5)
+        # Causal mask
+        causal = torch.triu(
+            torch.full((T, T), float("-inf"), device=x.device), diagonal=1
+        )
+        scores = scores + causal
+        weights = torch.softmax(scores.float(), dim=-1)
+        attn_weights.append(weights[0])  # (n_head, T, T)
+
+        # Complete the block forward (using SDPA for the actual output)
+        y = F.scaled_dot_product_attention(q, k_rep, v_rep, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(1, T, -1)
+        y = attn.c_proj(y)
+        x = x + y
+        x = x + block.mlp(norm(x))
+
+    return attn_weights
 
 
 def predict_from_hiddens(model: DFM, hidden: torch.Tensor) -> torch.Tensor:

@@ -20,10 +20,13 @@ from .model import (
     DFM,
     DFMConfig,
     KVCache,
+    extract_attention_weights,
     predict_from_hiddens,
     transformer_forward,
 )
 from .schemas import (
+    AttentionRequest,
+    AttentionResponse,
     DeleteResponse,
     HealthResponse,
     PredictRequest,
@@ -163,6 +166,8 @@ class LearnerState:
     history: list[tuple[int, float, torch.Tensor | None]] = field(default_factory=list)
     # Each entry: (task_idx, outcome, pre-projected_answer_emb or None)
     # answer_emb is (n_embd,) already projected through answer_proj, or None if "[None]"
+    answer_strings: list[str | None] = field(default_factory=list)
+    # Original answer text for each entry (for attention visualization)
 
 
 learners: dict[str, LearnerState] = {}
@@ -218,15 +223,22 @@ def load_model(
             cleaned[k.removeprefix("module.").removeprefix("_orig_mod.")] = v
         result = model.load_state_dict(cleaned, strict=False)
         if result.missing_keys:
-            console.log(
-                f"[yellow]Missing keys:[/] {result.missing_keys}"
-            )
+            console.log(f"[yellow]Missing keys:[/] {result.missing_keys}")
         unexpected = [
-            k for k in result.unexpected_keys
-            if not k.startswith(("task_embeddings", "answer_embeddings",
-                                 "task_token_ids", "task_attention_masks",
-                                 "answer_token_ids", "answer_attention_masks",
-                                 "task_embedding_cache", "answer_embedding_cache"))
+            k
+            for k in result.unexpected_keys
+            if not k.startswith(
+                (
+                    "task_embeddings",
+                    "answer_embeddings",
+                    "task_token_ids",
+                    "task_attention_masks",
+                    "answer_token_ids",
+                    "answer_attention_masks",
+                    "task_embedding_cache",
+                    "answer_embedding_cache",
+                )
+            )
         ]
         if unexpected:
             console.log(f"[yellow]Unexpected keys:[/] {unexpected}")
@@ -510,13 +522,17 @@ def register_learner(req: RegisterRequest):
             )
 
         answer_embs = encode_answers(answers)
-        for task_str, outcome, answer_emb in zip(req.tasks, req.outcomes, answer_embs):
+        for task_str, outcome, answer_emb, ans_str in zip(
+            req.tasks, req.outcomes, answer_embs, answers
+        ):
             task_idx = lookup_task_idx(task_str)
             state.history.append((task_idx, outcome, answer_emb))
+            state.answer_strings.append(ans_str if ans_str != "[None]" else None)
 
         # Truncate to max context size
         if len(state.history) > max_context_size:
             state.history = state.history[-max_context_size:]
+            state.answer_strings = state.answer_strings[-max_context_size:]
 
     learners[req.learner_id] = state
     return RegisterResponse(learner_id=req.learner_id, history_len=len(state.history))
@@ -623,13 +639,17 @@ def update(req: UpdateRequest):
         )
 
     answer_embs = encode_answers(answers)
-    for task_str, outcome, answer_emb in zip(req.tasks, req.outcomes, answer_embs):
+    for task_str, outcome, answer_emb, ans_str in zip(
+        req.tasks, req.outcomes, answer_embs, answers
+    ):
         task_idx = lookup_task_idx(task_str)
         learner.history.append((task_idx, outcome, answer_emb))
+        learner.answer_strings.append(ans_str if ans_str != "[None]" else None)
 
     # Truncate to max context size
     if len(learner.history) > max_context_size:
         learner.history = learner.history[-max_context_size:]
+        learner.answer_strings = learner.answer_strings[-max_context_size:]
 
     return UpdateResponse(learner_id=req.learner_id, history_len=len(learner.history))
 
@@ -664,6 +684,147 @@ def get_config():
         "block_size": cfg.block_size,
         "max_context_size": max_context_size,
     }
+
+
+@app.post("/attention", response_model=AttentionResponse)
+@torch.no_grad()
+def get_attention(req: AttentionRequest):
+    """Extract attention weights for a learner's context.
+
+    Returns per-layer attention aggregated by token type: for each layer,
+    how much attention does each position receive from all other positions,
+    grouped by token type (BOS, TASK, OUTCOME, ANSWER).
+    """
+    learner = get_learner(req.learner_id)
+    if not learner.history:
+        raise HTTPException(status_code=400, detail="Learner has no history")
+
+    device = get_device()
+    dtype = torch.bfloat16
+    D_embd = model.config.n_embd
+
+    # Build the same embedded sequence as build_context_and_prefill
+    n_tokens = 1  # BOS
+    for _, _, answer_emb in learner.history:
+        n_tokens += 3 if answer_emb is not None else 2
+
+    token_types_list = [0]  # BOS
+    token_labels = ["BOS"]
+
+    # Reverse lookup for task names
+    idx_to_task = {v: k for k, v in task_to_idx.items()}
+
+    for i, (task_idx, outcome, answer_emb) in enumerate(learner.history):
+        task_name = idx_to_task.get(task_idx, f"task_{task_idx}")
+        token_types_list.append(1)  # TASK
+        token_labels.append(f"T:{task_name}")
+        token_types_list.append(2)  # OUTCOME
+        token_labels.append(f"O:{outcome:.2f}")
+        if answer_emb is not None:
+            ans_str = (
+                learner.answer_strings[i] if i < len(learner.answer_strings) else None
+            )
+            token_types_list.append(3)  # ANSWER
+            token_labels.append(f"A:{ans_str}" if ans_str else "A")
+
+    token_types_t = torch.tensor([token_types_list], dtype=torch.long, device=device)
+
+    # Build embedded tokens (same as build_context_and_prefill)
+    x = torch.zeros(1, n_tokens, D_embd, dtype=dtype, device=device)
+    x[0, 0] = model.embedding.bos_emb.to(dtype)
+    pos = 1
+    for task_idx, outcome, answer_emb in learner.history:
+        x[0, pos] = task_emb_table[task_idx]
+        pos += 1
+        outcome_t = torch.tensor([[[outcome]]], dtype=dtype, device=device)
+        x[0, pos] = model.embedding.outcome_proj(outcome_t).squeeze()
+        pos += 1
+        if answer_emb is not None:
+            x[0, pos] = answer_emb
+            pos += 1
+    # Append target task if provided
+    if req.target_task is not None:
+        target_idx = lookup_task_idx(req.target_task)
+        target_x = task_emb_table[target_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+        x = torch.cat([x, target_x], dim=1)
+        token_types_list.append(1)  # TASK
+        token_labels.append(f"TARGET:{req.target_task}")
+        n_tokens += 1
+        token_types_t = torch.tensor(
+            [token_types_list], dtype=torch.long, device=device
+        )
+
+    x = x + model.embedding.type_emb(token_types_t).to(dtype)
+
+    # Extract attention weights
+    attn_weights = extract_attention_weights(model, x)
+
+    # Aggregate: for each layer, mean attention received per token type
+    # attn_weights[layer] is (n_head, T, T) — weights[h, i, j] = how much pos i attends to pos j
+    # Mean over heads, then sum over query positions -> how much attention each key position receives
+    n_layers = len(attn_weights)
+    n_heads = attn_weights[0].size(0)
+    T = n_tokens
+    types_arr = torch.tensor(token_types_list, device=device)
+
+    type_names = ["BOS", "TASK", "OUTCOME", "ANSWER"]
+    attn_by_type = {name: [] for name in type_names}
+    last_pos_attn_by_type = {name: [] for name in type_names}
+    mean_attn_distance = []
+    last_pos_attn_distance = []
+    positions = torch.arange(T, device=device, dtype=torch.float)
+
+    for layer_idx in range(n_layers):
+        w = attn_weights[layer_idx]  # (n_head, T, T)
+        w_mean = w.mean(dim=0)  # (T, T) — mean over heads
+
+        # All positions: sum over query positions -> attention received by each key
+        received = w_mean.sum(dim=0)  # (T,)
+        received = received / received.sum()
+
+        # Last position only: w_mean[-1, :] = what the last token attends to
+        last_row = w_mean[-1]  # (T,) — already sums to 1
+
+        # Mean attention distance: for each query position i, weighted mean of (i - j)
+        # distance[i] = sum_j w[i,j] * (i - j)
+        dist_matrix = positions.unsqueeze(0) - positions.unsqueeze(1)  # (T, T)
+        dist_matrix = dist_matrix.clamp(min=0)  # only look back (causal)
+        mean_dist = (w_mean * dist_matrix).sum(dim=1).mean()  # avg over all positions
+        mean_attn_distance.append(float(mean_dist))
+
+        # Last position distance
+        last_dist = (last_row * (T - 1 - positions)).sum()
+        last_pos_attn_distance.append(float(last_dist))
+
+        for type_id, name in enumerate(type_names):
+            mask = types_arr == type_id
+            if mask.any():
+                attn_by_type[name].append(float(received[mask].sum()))
+                last_pos_attn_by_type[name].append(float(last_row[mask].sum()))
+            else:
+                attn_by_type[name].append(0.0)
+                last_pos_attn_by_type[name].append(0.0)
+
+    # Per-position attention from last position, averaged across all layers and heads
+    last_pos_per_pos = torch.zeros(T, device=device)
+    for layer_idx in range(n_layers):
+        w = attn_weights[layer_idx]  # (n_head, T, T)
+        last_pos_per_pos += w[:, -1, :].mean(dim=0)  # mean over heads
+    last_pos_per_pos = last_pos_per_pos / n_layers  # mean over layers
+
+    return AttentionResponse(
+        learner_id=req.learner_id,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        seq_len=T,
+        token_types=token_types_list,
+        token_labels=token_labels,
+        attn_by_type=attn_by_type,
+        last_pos_attn_by_type=last_pos_attn_by_type,
+        last_pos_attn_per_position=last_pos_per_pos.tolist(),
+        mean_attn_distance=mean_attn_distance,
+        last_pos_attn_distance=last_pos_attn_distance,
+    )
 
 
 @app.post("/gc")
