@@ -2,7 +2,7 @@
 DFM model (synced from dfm-training, inference-only) + KV cache for incremental inference.
 
 Architecture: 4 token types (BOS=0, TASK=1, OUTCOME=2, ANSWER=3),
-BCE prediction head (single logit per task position).
+MSE prediction head (single output per task position).
 """
 
 import copy
@@ -536,7 +536,7 @@ class DFM(nn.Module):
                 ),
             }
         )
-        # BCE prediction head — single logit per position
+        # MSE prediction head — single output per position
         self.prediction_head = nn.Linear(self.config.n_embd, 1, bias=False)
 
         # Rotary embeddings
@@ -602,12 +602,12 @@ class DFM(nn.Module):
         valid_hiddens = x[valid_mask]
         valid_targets = target_outcomes[valid_mask]
 
-        logits = self.prediction_head(valid_hiddens).squeeze(-1).float()
+        preds = self.prediction_head(valid_hiddens).squeeze(-1).float()
 
-        # BCE loss
-        loss = F.binary_cross_entropy_with_logits(logits, valid_targets.float())
+        # MSE loss
+        loss = F.mse_loss(preds, valid_targets.float())
 
-        return logits, loss, x.detach()
+        return preds, loss, x.detach()
 
 
 # ---------------------------------------------------------------------------
@@ -689,12 +689,12 @@ def extract_attention_weights(model: DFM, x: torch.Tensor) -> list[torch.Tensor]
 
 
 def predict_from_hiddens(model: DFM, hidden: torch.Tensor) -> torch.Tensor:
-    """Apply BCE prediction head -> sigmoid probabilities.
+    """Apply MSE prediction head -> clamped probabilities.
 
     Args:
         hidden: (B, T, n_embd) or (N, n_embd)
     Returns:
         probabilities — same leading dims, last dim squeezed
     """
-    logits = model.prediction_head(hidden).squeeze(-1).float()
-    return torch.sigmoid(logits)
+    preds = model.prediction_head(hidden).squeeze(-1).float()
+    return preds.clamp(0, 1)

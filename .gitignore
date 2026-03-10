@@ -4,3 +4,4 @@ __pycache__/
 checkpoints/
 benchmark/results/
 benchmark/results_nontrivial/
+benchmark/results.csv

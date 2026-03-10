@@ -177,7 +177,7 @@ def test_batched_fork():
                 h = naive_forward(model, x_full)
                 # Prediction at last position
                 pred = model.prediction_head(h[:, -1:, :]).squeeze(-1).float()
-                naive_preds[s, t] = torch.sigmoid(pred).item()
+                naive_preds[s, t] = pred.clamp(0, 1).item()
 
     # Cached: prefill prefix, fork to S for curriculum, fork to S*T for targets
     kv_cache = KVCache(CONFIG, max_len=256, device=DEVICE, dtype=DTYPE)
@@ -194,9 +194,7 @@ def test_batched_fork():
         # Build target tokens: (S*T, 1, D)
         target_x = x_targets.expand(S, -1, -1).reshape(S * T, 1, -1)
         hidden = transformer_forward(model, target_x, target_cache)  # (S*T, 1, D)
-        cached_preds = torch.sigmoid(
-            model.prediction_head(hidden).squeeze(-1).float()
-        ).reshape(S, T)
+        cached_preds = model.prediction_head(hidden).squeeze(-1).float().clamp(0, 1).reshape(S, T)
 
     diff = (naive_preds - cached_preds).abs().max().item()
     print(f"  Max abs diff: {diff:.6f} (atol={ATOL})")
@@ -244,7 +242,7 @@ def test_fork_no_curriculum():
             x_full = torch.cat([x_prefix, x_targets[:, t : t + 1]], dim=1)
             h = naive_forward(model, x_full)
             pred = model.prediction_head(h[:, -1:, :]).squeeze(-1).float()
-            naive_preds[t] = torch.sigmoid(pred).item()
+            naive_preds[t] = pred.clamp(0, 1).item()
 
     # Cached: prefill prefix, fork to T, forward each target independently
     kv_cache = KVCache(CONFIG, max_len=256, device=DEVICE, dtype=DTYPE)
@@ -253,7 +251,7 @@ def test_fork_no_curriculum():
         batched_cache = BatchedKVCache(kv_cache, batch_size=T, extra_len=1)
         target_x = x_targets.squeeze(0).unsqueeze(1)  # (T, 1, D)
         hidden = transformer_forward(model, target_x, batched_cache)  # (T, 1, D)
-        cached_preds = torch.sigmoid(model.prediction_head(hidden).float()).view(
+        cached_preds = model.prediction_head(hidden).float().clamp(0, 1).view(
             T
         )  # (T,)
 
@@ -290,7 +288,7 @@ def test_target_independence():
         target_cache = BatchedKVCache.fork(batched_cache, fan_out=T, extra_len=1)
         target_x = x_targets.reshape(T, 1, -1)
         hidden_all = transformer_forward(model, target_x, target_cache)  # (T, 1, D)
-        preds_all = torch.sigmoid(model.prediction_head(hidden_all).float()).view(
+        preds_all = model.prediction_head(hidden_all).float().clamp(0, 1).view(
             T
         )  # (T,)
 
@@ -305,8 +303,8 @@ def test_target_independence():
             hidden_t = transformer_forward(
                 model, x_targets[:, t : t + 1, :], target_cache_t
             )
-            preds_individual[t] = torch.sigmoid(
-                model.prediction_head(hidden_t).squeeze(-1).float()
+            preds_individual[t] = (
+                model.prediction_head(hidden_t).squeeze(-1).float().clamp(0, 1)
             ).item()
 
     diff = (preds_all - preds_individual).abs().max().item()
