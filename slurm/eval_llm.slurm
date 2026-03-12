@@ -21,12 +21,12 @@ conda activate dfm-server
 export HF_HUB_OFFLINE=1
 
 # --- Configuration (edit these) ---
-CHECKPOINT=${DFM_CHECKPOINT:-$SCRATCH/dfm-training/llm/ckpt.pt}
+CHECKPOINT=${DFM_CHECKPOINT:-$SCRATCH/dfm-training/rl/ckpt.pt}
 TASKS=${DFM_TASKS:-$SCRATCH/tasks.json}
 TRAJECTORY=${TRAJECTORY:-$SCRATCH/dfm-test/rl_Qwen2.5-1.5B-Instruct_dapo_bs64_lr5e-6_seed42/history.json}
 EVAL_DIR=${EVAL_DIR:-$SCRATCH/dfm-test/rl_eval_Qwen2.5-1.5B-Instruct_dapo}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-RESULTS_DIR=${RESULTS_DIR:-$SCRATCH/dfm-training/llm}
+RESULTS_DIR=${RESULTS_DIR:-$SCRATCH/dfm-training/rl}
 
 mkdir -p "$RESULTS_DIR"
 
