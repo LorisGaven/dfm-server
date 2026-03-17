@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-DFM-Server is a FastAPI inference server for the Developmental Foundation Model (DFM) — a universal outcome predictor. Given a learner's history of (task, outcome) pairs, it predicts the outcome on the next task using an MSE (Mean Squared Error) prediction head. Supports learner registration, outcome prediction, autoregressive forecasting, and per-learner KV-cache management.
+DFM-Server is a FastAPI inference server for the Developmental Foundation Model (DFM) — a universal outcome predictor. Given a learner's history of (task, outcome) pairs, it predicts the outcome on the next task using a BCE (Binary Cross-Entropy) prediction head. Supports learner registration, outcome prediction, autoregressive forecasting, and per-learner KV-cache management.
 
 The model is trained in the sibling repository `../dfm-training/` (has its own `CLAUDE.md` with full details on the training pipeline, data collection, and model architecture).
 
@@ -65,9 +65,9 @@ Input is `[task₀, out₀, task₁, out₁, ...]` (2*T tokens for T task-outcom
 - `BatchedKVCache` — forked from a learner's prefix for batched forecast. Views into the source prefix (zero-copy), allocates only the per-batch suffix. Also supports `fork()` class method to re-fork a BatchedKVCache into a larger batch with additional slots.
 
 ### Prediction model
-The prediction head outputs a single value per task position (MSE):
-- **Predict endpoint**: returns `clamp(output, 0, 1)` as the predicted probability.
-- **Forecast endpoint**: returns clamped predictions as autoregressive feedback.
+The prediction head outputs a single logit per task position (BCE):
+- **Predict endpoint**: returns `sigmoid(logit)` as the predicted probability.
+- **Forecast endpoint**: returns sigmoid predictions as autoregressive feedback.
 
 ### Key invariants
 - **BOS convention**: task index 0 = zeros, outcome = -1.0. Learned BOS embeddings replace these in the embedding layer.
@@ -77,4 +77,4 @@ The prediction head outputs a single value per task position (MSE):
 - **MAX_SEQ_LEN = 32768** interleaved tokens per learner.
 
 ### Model architecture
-Transformer with rotary embeddings, QK norm, ReLU² MLP, Multi-Query Attention (n_head Q, n_kv_head KV). Prediction head outputs a single value per task position, trained with MSE loss. Predicted probability via clamp to [0, 1].
+Transformer with rotary embeddings, QK norm, ReLU² MLP, Multi-Query Attention (n_head Q, n_kv_head KV). Prediction head outputs a single logit per task position, trained with BCE loss. Predicted probability via sigmoid.
