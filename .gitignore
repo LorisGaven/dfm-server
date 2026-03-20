@@ -1,7 +1,7 @@
 __pycache__/
 *.egg-info/
 *.pyc
-checkpoints/
+checkpoints/*
 benchmark/results/
 benchmark/results_nontrivial/
-benchmark/results.csv
+benchmark/results*.csv

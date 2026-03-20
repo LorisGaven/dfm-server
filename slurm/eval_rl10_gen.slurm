@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=dfm-eval-rl1-gen
+#SBATCH --job-name=dfm-eval-rl10-gen
 #SBATCH --time=02:00:00
-#SBATCH --output=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl1-gen.out
-#SBATCH --error=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl1-gen.err
+#SBATCH --output=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl10-gen.out
+#SBATCH --error=/lustre/fswork/projects/rech/imi/uej51wk/slurm_logs/dfm-eval-rl10-gen.err
 #SBATCH --qos=qos_gpu_h100-dev
 #SBATCH -C h100
 #SBATCH --gres=gpu:1
@@ -21,17 +21,17 @@ conda activate dfm-server
 export HF_HUB_OFFLINE=1
 
 # --- Configuration (edit these) ---
-CHECKPOINT=${DFM_CHECKPOINT:-$SCRATCH/dfm-training/rl1_gen/ckpt.pt}
+CHECKPOINT=${DFM_CHECKPOINT:-$SCRATCH/dfm-training/rl10_gen/ckpt.pt}
 TASKS=${DFM_TASKS:-$SCRATCH/tasks.json}
 TRAJECTORY=${TRAJECTORY:-$SCRATCH/dfm-test/rl_Qwen2.5-1.5B-Instruct_dapo_bs64_lr5e-6_seed42/history.json}
 EVAL_DIR=${EVAL_DIR:-$SCRATCH/dfm-test/rl_eval_Qwen2.5-1.5B-Instruct_dapo}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-RESULTS_DIR=${RESULTS_DIR:-$SCRATCH/dfm-training/rl1_gen}
+RESULTS_DIR=${RESULTS_DIR:-$SCRATCH/dfm-training/rl10_gen}
 
 mkdir -p "$RESULTS_DIR"
 
 # --- Start DFM server ---
-DFM_PORT=8010
+DFM_PORT=8020
 DFM_LOG="$RESULTS_DIR/server.log"
 
 echo "Starting DFM server (checkpoint=$CHECKPOINT, tasks=$TASKS)..."
